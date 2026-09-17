@@ -140,11 +140,12 @@ DROP INDEX t_y_hash_hcx_asc_idx;
 CREATE INDEX t_cbrtx_hash_y_hash_idx ON t ((cbrt(x), y) HASH);
 -- Query #2 should use the index
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) < 1.2 AND y < 2;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Seq Scan on t (actual rows=1 loops=1)
-   Storage Filter: ((y < 2) AND (cbrt((x)::double precision) < '1.2'::double precision))
-(2 rows)
+   Storage Filter: (y < 2)
+   Filter: (cbrt((x)::double precision) < '1.2'::double precision)
+(3 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) = 1 AND y = 1;
                                     QUERY PLAN                                     
@@ -154,18 +155,20 @@ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t W
 (2 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) < 1.2 AND y = 1;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Seq Scan on t (actual rows=1 loops=1)
-   Storage Filter: ((y = 1) AND (cbrt((x)::double precision) < '1.2'::double precision))
-(2 rows)
+   Storage Filter: (y = 1)
+   Filter: (cbrt((x)::double precision) < '1.2'::double precision)
+(3 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) = 1 AND y < 2;
-                                      QUERY PLAN                                       
----------------------------------------------------------------------------------------
+                           QUERY PLAN                            
+-----------------------------------------------------------------
  Seq Scan on t (actual rows=1 loops=1)
-   Storage Filter: ((y < 2) AND (cbrt((x)::double precision) = '1'::double precision))
-(2 rows)
+   Storage Filter: (y < 2)
+   Filter: (cbrt((x)::double precision) = '1'::double precision)
+(3 rows)
 
 DROP INDEX t_cbrtx_hash_y_hash_idx;
 CREATE INDEX t_cbrtx_asc_y_asc_idx ON t (cbrt(x) ASC, y ASC);
@@ -202,11 +205,12 @@ DROP INDEX t_cbrtx_asc_y_asc_idx;
 CREATE INDEX t_cbrtx_hash_y_asc_idx ON t (cbrt(x) HASH, y ASC);
 -- Query #2 and #4 should use the index
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) < 1.2 AND y < 2;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Seq Scan on t (actual rows=1 loops=1)
-   Storage Filter: ((y < 2) AND (cbrt((x)::double precision) < '1.2'::double precision))
-(2 rows)
+   Storage Filter: (y < 2)
+   Filter: (cbrt((x)::double precision) < '1.2'::double precision)
+(3 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) = 1 AND y = 1;
                                     QUERY PLAN                                     
@@ -216,11 +220,12 @@ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t W
 (2 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) < 1.2 AND y = 1;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Seq Scan on t (actual rows=1 loops=1)
-   Storage Filter: ((y = 1) AND (cbrt((x)::double precision) < '1.2'::double precision))
-(2 rows)
+   Storage Filter: (y = 1)
+   Filter: (cbrt((x)::double precision) < '1.2'::double precision)
+(3 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) = 1 AND y < 2;
                                     QUERY PLAN                                     
@@ -233,11 +238,12 @@ DROP INDEX t_cbrtx_hash_y_asc_idx;
 CREATE INDEX t_y_hash_cbrtx_asc_idx ON t (y HASH, cbrt(x) ASC);
 -- Query #2 and #3 should use the index
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) < 1.2 AND y < 2;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Seq Scan on t (actual rows=1 loops=1)
-   Storage Filter: ((y < 2) AND (cbrt((x)::double precision) < '1.2'::double precision))
-(2 rows)
+   Storage Filter: (y < 2)
+   Filter: (cbrt((x)::double precision) < '1.2'::double precision)
+(3 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) = 1 AND y = 1;
                                     QUERY PLAN                                     
@@ -254,11 +260,12 @@ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t W
 (2 rows)
 
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT cbrt(x), y FROM t WHERE cbrt(x) = 1 AND y < 2;
-                                      QUERY PLAN                                       
----------------------------------------------------------------------------------------
+                           QUERY PLAN                            
+-----------------------------------------------------------------
  Seq Scan on t (actual rows=1 loops=1)
-   Storage Filter: ((y < 2) AND (cbrt((x)::double precision) = '1'::double precision))
-(2 rows)
+   Storage Filter: (y < 2)
+   Filter: (cbrt((x)::double precision) = '1'::double precision)
+(3 rows)
 
 DROP INDEX t_y_hash_cbrtx_asc_idx;
 CREATE INDEX t_x_hash_y_hash_idx ON t ((x, y) HASH);

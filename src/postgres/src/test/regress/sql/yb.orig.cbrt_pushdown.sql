@@ -1,0 +1,26 @@
+-- GH #33911: cbrt() must not be pushed down. libc cbrt is not correctly
+-- rounded, so DocDB and PostgreSQL can disagree by 1 ULP and equality against
+-- a PostgreSQL-computed cube root drops the row.
+
+CREATE TABLE t (k int PRIMARY KEY, a int);
+INSERT INTO t VALUES (1, -23), (2, 23), (3, -8);
+
+-- Reference values computed in PostgreSQL, not by a pushed-down cbrt().
+SET yb_enable_expression_pushdown = off;
+CREATE TABLE lit AS SELECT a, cbrt(a::float8) AS cb FROM t;
+SET yb_enable_expression_pushdown = on;
+
+-- Plan shape: cbrt is a local Filter, not a Storage Filter.
+EXPLAIN (COSTS OFF) SELECT a FROM t WHERE cbrt(a::float8) < 0;
+EXPLAIN (COSTS OFF) SELECT a FROM t WHERE (||/ (a::float8)) < 0;
+
+-- Equality against this server's own cbrt, including inexact roots.
+SELECT t.a FROM t JOIN lit ON t.a = lit.a
+ WHERE cbrt(t.a::float8) = lit.cb
+ ORDER BY t.a;
+
+SELECT t.a FROM t JOIN lit ON t.a = lit.a
+ WHERE (||/ (t.a::float8)) = lit.cb
+ ORDER BY t.a;
+
+DROP TABLE t, lit;

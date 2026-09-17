@@ -80,7 +80,15 @@ const uint32 yb_funcs_unsafe_for_pushdown[] = {
 	F_SHA224,
 	F_SHA256,
 	F_SHA384,
-	F_SHA512
+	F_SHA512,
+
+	/*
+	 * libc cbrt is not correctly rounded. Postgres and tserver can bind
+	 * different libm implementations, so a pushed-down cbrt() disagrees with
+	 * PostgreSQL by 1 ULP and drops rows on equality (GH #33911).
+	 */
+	F_CBRT,
+	F_DCBRT
 };
 
 #define COMPARISON_AND_ARITHMETIC_OPS(prefix) \
