@@ -3121,12 +3121,13 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (4, 4), (13, 13);
  Insert on p_test (actual rows=0.00 loops=1)
    ->  Values Scan on "*VALUES*" (actual rows=2.00 loops=1)
          Storage Table Write Requests: 2
+         Storage Flush Requests: 1
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 2
- Storage Flush Requests: 1
-(8 rows)
+ Storage Flush Requests: 2
+(9 rows)
 
 EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (14, 14), (5, 5);
                          QUERY PLAN                         
@@ -3134,12 +3135,13 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (14, 14), (5, 5);
  Insert on p_test (actual rows=0.00 loops=1)
    ->  Values Scan on "*VALUES*" (actual rows=2.00 loops=1)
          Storage Table Write Requests: 2
+         Storage Flush Requests: 1
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 2
- Storage Flush Requests: 1
-(8 rows)
+ Storage Flush Requests: 2
+(9 rows)
 
 -- Inserts involving p_test_3 should be ineligible for single-shard.
 EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (21, 21);
@@ -3163,12 +3165,13 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (15, 15), (22, 22);
    ->  Values Scan on "*VALUES*" (actual rows=2.00 loops=1)
          Storage Table Write Requests: 2
          Storage Index Write Requests: 1
+         Storage Flush Requests: 1
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 3
- Storage Flush Requests: 1
-(9 rows)
+ Storage Flush Requests: 2
+(10 rows)
 
 EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (23, 23), (16, 16);
                          QUERY PLAN                         
@@ -3177,12 +3180,13 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (23, 23), (16, 16);
    ->  Values Scan on "*VALUES*" (actual rows=2.00 loops=1)
          Storage Table Write Requests: 2
          Storage Index Write Requests: 1
+         Storage Flush Requests: 1
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 3
- Storage Flush Requests: 1
-(9 rows)
+ Storage Flush Requests: 2
+(10 rows)
 
 -- Plans having multiple modify-table operations should be ineligible for single-shard.
 EXPLAIN (ANALYZE, DIST, COSTS OFF)
@@ -3197,12 +3201,13 @@ INSERT INTO p_test (SELECT cte.k + 1, cte.k + 1 FROM cte);
            ->  Result *RESULT* (actual rows=1.00 loops=1)
                  Storage Table Write Requests: 1
    ->  CTE Scan on cte (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 2
  Storage Flush Requests: 1
-(12 rows)
+(13 rows)
 
 EXPLAIN (ANALYZE, DIST, COSTS OFF)
 WITH cte AS (INSERT INTO p_test_2 VALUES (17, 17) RETURNING k)
@@ -3215,13 +3220,15 @@ INSERT INTO p_test (SELECT cte.k + 1, cte.k + 1 FROM cte);
            Storage Table Write Requests: 1
            ->  Result *RESULT* (actual rows=1.00 loops=1)
                  Storage Table Write Requests: 1
+                 Storage Flush Requests: 1
    ->  CTE Scan on cte (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 2
- Storage Flush Requests: 1
-(12 rows)
+ Storage Flush Requests: 2
+(14 rows)
 
 EXPLAIN (ANALYZE, DIST, COSTS OFF)
 WITH cte AS (INSERT INTO p_test VALUES (9, 9) RETURNING k)
@@ -3234,13 +3241,15 @@ INSERT INTO p_test (SELECT cte.k + 10, cte.k + 10 FROM cte);
            Storage Table Write Requests: 1
            ->  Result *RESULT* (actual rows=1.00 loops=1)
                  Storage Table Write Requests: 1
+                 Storage Flush Requests: 1
    ->  CTE Scan on cte (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 2
- Storage Flush Requests: 1
-(12 rows)
+ Storage Flush Requests: 2
+(14 rows)
 
 EXPLAIN (ANALYZE, DIST, COSTS OFF)
 WITH cte AS (INSERT INTO p_test VALUES (8, 8) RETURNING k)
@@ -3254,13 +3263,15 @@ INSERT INTO p_test (SELECT cte.k + 20, cte.k + 20 FROM cte);
            ->  Result *RESULT* (actual rows=1.00 loops=1)
                  Storage Table Write Requests: 1
                  Storage Index Write Requests: 1
+                 Storage Flush Requests: 1
    ->  CTE Scan on cte (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
  Storage Read Requests: 0
  Storage Read Ops: 0
  Storage Rows Scanned: 0
  Storage Write Requests: 3
- Storage Flush Requests: 1
-(13 rows)
+ Storage Flush Requests: 2
+(15 rows)
 
 SELECT * FROM p_test ORDER BY k;
  k  | v  
@@ -3381,12 +3392,12 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE p_test SET k = (k + 11) % 30 WHERE k I
                Storage Table Rows Scanned: 1
                Storage Table Write Requests: 2
                Storage Index Write Requests: 1
-               Storage Flush Requests: 2
+               Storage Flush Requests: 3
  Storage Read Requests: 2
  Storage Read Ops: 4
  Storage Rows Scanned: 2
  Storage Write Requests: 6
- Storage Flush Requests: 4
+ Storage Flush Requests: 5
 (25 rows)
 
 INSERT INTO p_test VALUES (1, 1);
