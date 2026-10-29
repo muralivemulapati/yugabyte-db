@@ -212,6 +212,9 @@ DEFINE_RUNTIME_AUTO_PG_FLAG(bool, yb_pushdown_is_not_null, kLocalVolatile, false
 DEFINE_RUNTIME_AUTO_PG_FLAG(bool, yb_enable_hash_batch_in, kLocalVolatile, false, true,
     "Enable batching of hash in queries.");
 
+DEFINE_RUNTIME_AUTO_PG_FLAG(bool, yb_push_hash_column_lists_to_docdb, kLocalVolatile, false, true,
+    "Push hash column lists to DocDB.");
+
 DEFINE_RUNTIME_AUTO_PG_FLAG(bool, yb_bypass_cond_recheck, kLocalVolatile, false, true,
     "DEPRECATED: no-op.");
 

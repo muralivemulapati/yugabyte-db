@@ -19,6 +19,8 @@ bool yb_debug_log_docdb_requests = false;
 
 bool yb_enable_hash_batch_in = true;
 
+bool yb_push_hash_column_lists_to_docdb = true;
+
 bool yb_non_ddl_txn_for_sys_tables_allowed = false;
 
 bool yb_format_funcs_include_yb_metadata = false;

@@ -417,6 +417,14 @@ message PgsqlPagingStatePB {
   // To hint PgGate about upcoming tablet switch
   // may be expected in cross tablet scan, or may indicate tablet split
   optional bytes next_tablet_bound = 9;
+
+  // Linear index range [begin, end) over the cartesian product of column_lists. The last hash
+  // column is the fast digit. Only permutations whose yb_hash_code falls in this tablet count
+  // toward the slice budget.
+  // When next_row_key is set, the next page rebuilds this same range and seeks to that key.
+  // When next_row_key is unset, end is unset and begin is the first index of the next slice.
+  optional uint64 hash_column_list_begin = 10;
+  optional uint64 hash_column_list_end = 11;
 }
 
 // Given: master --chunk--> tserver --batch--> postgres --page--> tserver
@@ -470,6 +478,10 @@ message GetTabletKeyRangesEmbeddedRequestPB {
   optional bytes upper_bound_key = 2;
   optional uint64 range_size_bytes = 3;
   optional uint32 max_key_length = 4;
+}
+
+message PgsqlHashColumnListsPB {
+  repeated QLValuePB column_list = 1;
 }
 
 // TODO(neil) The protocol for select needs to be changed accordingly when we introduce and cache
@@ -673,6 +685,11 @@ message PgsqlReadRequestPB {
 
   // See PgsqlWriteRequestPB::is_using_table_locks.
   optional bool is_using_table_locks = 50 [default = false];
+
+  // Stored as a pointer so pggate can build the lists once and ref the same
+  // message from every per-tablet clone.
+  optional PgsqlHashColumnListsPB column_lists = 51
+      [(rpc.lightweight_field).pointer = true];
 }
 
 //--------------------------------------------------------------------------------------------------

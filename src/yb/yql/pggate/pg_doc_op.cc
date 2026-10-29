@@ -31,6 +31,7 @@
 
 #include "yb/util/lw_function.h"
 #include "yb/util/random_util.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 
@@ -212,6 +213,16 @@ PgsqlReadOp& AsReadOp(const PgsqlOpPtr& op) {
 
 LWPgsqlReadRequestPB& AsReadReq(const PgsqlOpPtr& op) {
   return AsReadOp(op).read_request();
+}
+
+// Values of a hash-column IN live in the nested condition built by PgColumn::SetSubExprs.
+// An unexpected shape counts as one value so it is not treated as a multi-key scan.
+size_t HashInValueCount(const LWPgsqlExpressionPB& expr) {
+  const auto& operands = expr.condition().operands();
+  if (operands.size() < 2 || !operands.back().has_condition()) {
+    return 1;
+  }
+  return operands.back().condition().operands().size();
 }
 
 } // namespace
@@ -821,6 +832,99 @@ bool CouldBeExecutedInParallel(const LWPgsqlReadRequestPB& req) {
   return !req.has_is_forward_scan();
 }
 
+bool CanPushHashColumnLists(const LWPgsqlReadRequestPB& req, PgIsolationLevel isolation_level) {
+  const auto& partition_column_values = req.partition_column_values();
+  // Range and sequential scans have no hash binds.
+  if (partition_column_values.empty()) {
+    return false;
+  }
+  // column_lists does not return rows in key order: each tablet expands its keys in slices and
+  // the tablets are read in parallel. A scan that needs order has its direction set (see
+  // create_index_path in pathnode.c) and stays on the permutation path.
+  if (req.has_is_forward_scan()) {
+    return false;
+  }
+  // column_lists is one scan of many non-contiguous hash keys. Serializable cannot lock those
+  // keys from one request, so it stays on one point read per key.
+  if (!yb_push_hash_column_lists_to_docdb ||
+      isolation_level == PgIsolationLevel::SERIALIZABLE) {
+    return false;
+  }
+  // A single hash key (WHERE h = 5) stays on the exact-key path: column_lists clears
+  // partition_column_values, which is the read-intent key for FOR UPDATE/SHARE. An empty IN does
+  // not arrive: ExecEvalScalarArrayOp returns false for an empty array, and YbBindSearchArray sets
+  // quit_scan when YbCullArray leaves no elements, before ybcBindColumnCondIn.
+  bool single_hash_key = true;
+  for (const auto& col_expr : partition_column_values) {
+    if (!col_expr.has_condition()) {
+      continue;
+    }
+    // A correlated ROW(h1, h2, ...) IN (...) bind cannot be split into per-column lists. It uses
+    // the tuple batching path.
+    if (col_expr.condition().operands().front().has_tuple()) {
+      return false;
+    }
+    if (HashInValueCount(col_expr) != 1) {
+      single_hash_key = false;
+    }
+  }
+  return !single_hash_key;
+}
+
+// Convert partition_column_values IN/equality expressions into compact per-column lists.
+// The source expressions stay on the caller's arena; list elems are refs, not copies.
+// A bind that is not a scalar or a non-empty IN is an error. An empty IN is rejected in scan-key
+// binding and does not reach here.
+Status InitHashColumnLists(
+    ArenaList<LWPgsqlExpressionPB>& partition_column_values,
+    LWPgsqlHashColumnListsPB& column_lists) {
+  size_t col_idx = 0;
+  for (auto& col_expr : partition_column_values) {
+    if (col_expr.has_value()) {
+      column_lists.add_column_list()->mutable_list_value()->mutable_elems()->push_back_ref(
+          col_expr.mutable_value());
+      ++col_idx;
+      continue;
+    }
+    if (!col_expr.has_condition() || col_expr.condition().operands().size() < 2) {
+      return STATUS_FORMAT(
+          InvalidArgument, "Hash column bind $0 cannot be represented as a compact IN list",
+          col_idx);
+    }
+    auto& cond = *col_expr.mutable_condition();
+    auto& operands = *cond.mutable_operands();
+    auto* list = column_lists.add_column_list()->mutable_list_value();
+    // Equality is a scalar RHS. IN stores values as operands of a nested condition; calling
+    // mutable_condition() on a scalar RHS would drop the bound.
+    if (cond.op() == QL_OP_EQUAL) {
+      if (!operands.back().has_value()) {
+        return STATUS_FORMAT(
+            InvalidArgument, "Hash column bind $0 cannot be represented as a compact IN list",
+            col_idx);
+      }
+      list->mutable_elems()->push_back_ref(operands.back().mutable_value());
+      ++col_idx;
+      continue;
+    }
+    if (cond.op() != QL_OP_IN || !operands.back().has_condition() ||
+        operands.back().condition().operands().empty()) {
+      return STATUS_FORMAT(
+          InvalidArgument, "Hash column bind $0 cannot be represented as a compact IN list",
+          col_idx);
+    }
+    for (auto& value : *operands.back().mutable_condition()->mutable_operands()) {
+      if (!value.has_value()) {
+        return STATUS_FORMAT(
+            InvalidArgument, "Hash column bind $0 cannot be represented as a compact IN list",
+            col_idx);
+      }
+      list->mutable_elems()->push_back_ref(value.mutable_value());
+    }
+    ++col_idx;
+  }
+  return Status::OK();
+}
+
 Result<bool> PgDocReadOp::DoCreateRequests() {
   // All information from the SQL request has been collected and setup. This code populates
   // Protobuf requests before sending them to DocDB. For performance reasons, requests are
@@ -831,8 +935,10 @@ Result<bool> PgDocReadOp::DoCreateRequests() {
   // - SELECT * FROM sql_table WHERE hash_c1 IN (1, 2, 3) AND hash_c2 IN (4, 5, 6);
   // the function creates multiple requests for possible hash permutations / keys.
   // The requests are also configured to run in parallel.
+  // When CanPushHashColumnLists() allows it, the hash binds go to DocDB as column_lists and pggate
+  // only routes the permutations to the tablets they cover.
   if (!req.partition_column_values().empty()) {
-    return PopulateNextHashPermutationOps();
+    return UseHashColumnLists() ? PopulateHashColumnListsOps() : PopulateNextHashPermutationOps();
 
   // There is no key values to filter out partitions, send requests to all of them.
   // Requests pushing down aggregates and/or filter expression tend to do more work on DocDB side,
@@ -1074,53 +1180,80 @@ Result<bool> PgDocReadOp::BindExprsRegular(
   return true;
 }
 
+Result<PgDocReadOp::PartitionBatch*> PgDocReadOp::EnsurePartitionBatch(
+    PartitionBatches& partition_batches,
+    const std::string& partition_key,
+    const ReadOpProvider& read_op_provider,
+    const PartitionOpInitFn& init_fn,
+    size_t* unclassified) {
+  auto partition = client::FindPartitionStartIndex(table_->GetPartitionList(), partition_key);
+  DCHECK(partition < partition_batches.size());
+  auto& batch = partition_batches[partition];
+  if (batch.request_range && batch.request_range->IsEmpty()) {
+    return nullptr;
+  }
+  if (batch.read_op) {
+    return &batch;
+  }
+  if (unclassified) {
+    --*unclassified;
+  }
+  PgReadRange request_range(table_);
+  request_range.SetRequestBounds(GetTemplateReadReq());
+  request_range.SetPartitionBounds(partition);
+  // read_op_provider clones an op, so check the request bounds before taking one.
+  if (request_range.IsEmpty()) {
+    batch.request_range.emplace(std::move(request_range));
+    return nullptr;
+  }
+  batch.read_op = &VERIFY_RESULT_REF(read_op_provider());
+  auto& read_req = batch.read_op->read_request();
+  // The clone carries the template bounds, which request_range already includes.
+  const auto applied = request_range.ApplyBounds(read_req);
+  DCHECK(applied);
+  init_fn(batch, read_req);
+  PgReadRange partition_range(table_);
+  partition_range.SetPartitionBounds(partition);
+  if (request_range != partition_range) {
+    batch.request_range.emplace(std::move(request_range));
+  }
+  return &batch;
+}
+
+Result<bool> PgDocReadOp::PermutationInRequestRange(
+    const PartitionBatch& batch, uint16_t hash_code, const QLValuePBs& values) {
+  if (!batch.request_range) {
+    return true;
+  }
+  // The hash permutation key generally is a range, keys with the same hash code and the hash
+  // values, but different range values. It is a single value range if there's no range columns.
+  // Skip the permutation if it is fully outside of the request range.
+  PgReadRange permutation_range(table_);
+  RETURN_NOT_OK(permutation_range.SetHashAndRangeValuesBound(
+      hash_code, values, true /* is_inclusive */, true /* is_lower */));
+  RETURN_NOT_OK(permutation_range.SetHashAndRangeValuesBound(
+      hash_code, values, true /* is_inclusive */, false /* is_lower */));
+  return batch.request_range->Intersects(permutation_range);
+}
+
 Result<bool> PgDocReadOp::BindExprsToBatch(
     PartitionBatches& partition_batches, const QLValuePBs& values,
     const ReadOpProvider& read_op_provider) {
   std::span hash_values(values.begin(), table_->num_hash_key_columns());
   auto partition_key = VERIFY_RESULT(table_->partition_schema().EncodePgsqlHash(hash_values));
   auto hash_code = table_->partition_schema().DecodeMultiColumnHashValue(partition_key);
-  auto partition = client::FindPartitionStartIndex(table_->GetPartitionList(), partition_key);
-  DCHECK(partition < partition_batches.size());
-  auto& partition_batch = partition_batches[partition];
-  if (partition_batch.request_range && partition_batch.request_range->IsEmpty()) {
+  const auto init_fn = [this](PartitionBatch& batch, LWPgsqlReadRequestPB& read_req) {
+    batch.rhs_values = InitHashPermutationBatch(read_req);
+  };
+  auto* partition_batch = VERIFY_RESULT(EnsurePartitionBatch(
+      partition_batches, partition_key, read_op_provider, make_lw_function(init_fn)));
+  if (!partition_batch) {
     return false;
   }
-  if (!partition_batch.read_op) {
-    PgReadRange request_range(table_);
-    request_range.SetRequestBounds(GetTemplateReadReq());
-    request_range.SetPartitionBounds(partition);
-    // read_op_provider clones an op, so check the request bounds before taking one.
-    if (request_range.IsEmpty()) {
-      partition_batch.request_range.emplace(std::move(request_range));
-      return false;
-    }
-    partition_batch.read_op = &VERIFY_RESULT_REF(read_op_provider());
-    auto& read_req = partition_batch.read_op->read_request();
-    // The clone carries the template bounds, which request_range already includes.
-    const auto applied = request_range.ApplyBounds(read_req);
-    DCHECK(applied);
-    partition_batch.rhs_values = InitHashPermutationBatch(read_req);
-    PgReadRange partition_range(table_);
-    partition_range.SetPartitionBounds(partition);
-    if (request_range != partition_range) {
-      partition_batch.request_range.emplace(std::move(request_range));
-    }
+  if (!VERIFY_RESULT(PermutationInRequestRange(*partition_batch, hash_code, values))) {
+    return false;
   }
-  if (partition_batch.request_range) {
-    // The hash permutation key generally is a range, keys with the same hash code and the hash
-    // values, but different range values. It is a single value range if there's no range columns.
-    // Skip the permutation if it is fully outside of the request range.
-    PgReadRange permutation_range(table_);
-    RETURN_NOT_OK(permutation_range.SetHashAndRangeValuesBound(
-        hash_code, values, true /* is_inclusive */, true /* is_lower */));
-    RETURN_NOT_OK(permutation_range.SetHashAndRangeValuesBound(
-        hash_code, values, true /* is_inclusive */, false /* is_lower */));
-    if (!partition_batch.request_range->Intersects(permutation_range)) {
-      return false;
-    }
-  }
-  auto* mutable_rhs_values = partition_batch.rhs_values->mutable_value()->mutable_list_value();
+  auto* mutable_rhs_values = partition_batch->rhs_values->mutable_value()->mutable_list_value();
   // Add new tuple with the hash code and the provided key values
   auto* tup_elements = mutable_rhs_values->add_elems()->mutable_tuple_value();
   auto* new_elem = tup_elements->add_elems();
@@ -1131,7 +1264,7 @@ Result<bool> PgDocReadOp::BindExprsToBatch(
       *new_elem = *elem;
     }
   }
-  partition_batch.read_op->set_active(true);
+  partition_batch->read_op->set_active(true);
 
   return true;
 }
@@ -1243,6 +1376,98 @@ LWPgsqlExpressionPB* PgDocReadOp::InitHashPermutationBatch(LWPgsqlReadRequestPB&
   }
   // RHS of IN condition
   return cond_bind_expr.mutable_condition()->add_operands();
+}
+
+bool PgDocReadOp::UseHashColumnLists() {
+  if (PREDICT_TRUE(use_hash_column_lists_.has_value())) {
+    return *use_hash_column_lists_;
+  }
+  use_hash_column_lists_ = CanPushHashColumnLists(
+      read_op_->read_request(), pg_session_->GetIsolationLevel());
+  return *use_hash_column_lists_;
+}
+
+Result<bool> PgDocReadOp::ActivatePartitionForPermutation(
+    PartitionBatches& partition_batches, const QLValuePBs& values,
+    const ReadOpProvider& read_op_provider,
+    LWPgsqlHashColumnListsPB* column_lists,
+    size_t* unclassified) {
+  std::span hash_values(values.begin(), table_->num_hash_key_columns());
+  auto partition_key = VERIFY_RESULT(table_->partition_schema().EncodePgsqlHash(hash_values));
+  const auto init_fn = [column_lists](PartitionBatch& /*batch*/, LWPgsqlReadRequestPB& read_req) {
+    // Drop the copied hash binds on the clone. DocDB expands column_lists; leaving
+    // partition_column_values would keep the legacy permutation path on the same request.
+    read_req.clear_partition_column_values();
+    read_req.ref_column_lists(column_lists);
+  };
+  auto* partition_batch = VERIFY_RESULT(EnsurePartitionBatch(
+      partition_batches, partition_key, read_op_provider, make_lw_function(init_fn), unclassified));
+  if (!partition_batch) {
+    return false;
+  }
+  if (partition_batch->request_range) {
+    auto hash_code = table_->partition_schema().DecodeMultiColumnHashValue(partition_key);
+    if (!VERIFY_RESULT(PermutationInRequestRange(*partition_batch, hash_code, values))) {
+      return false;
+    }
+  }
+  partition_batch->read_op->set_active(true);
+  return true;
+}
+
+Result<bool> PgDocReadOp::PopulateHashColumnListsOps() {
+  // Convert binds once, then park them off the template so DeepCopy does not duplicate IN lists
+  // onto every tablet clone. Restore before return: ApplyParallelRange / ResetPgsqlOps re-runs
+  // DoCreateRequests per PG parallel range, and an empty template would take the unconstrained
+  // hash-range path (wrong rows for e.g. c = 10).
+  // Clones and column_lists go on a dedicated arena, as on the legacy hash path. ResetPgsqlOps
+  // resets it between PG parallel ranges; the template op's arena cannot be reset.
+  if (!pgsql_op_arena_) {
+    DCHECK(pgsql_ops_.empty());
+    pgsql_op_arena_ = SharedThreadSafeArena();
+  }
+  // TODO(tsplit): what if table partition is changed during PgDocReadOp lifecycle?
+  const auto& partition_keys = table_->GetPartitionList();
+  auto permutations = InitializeHashPermutationStates();
+  auto* partition_column_binds = read_op_->read_request().mutable_partition_column_values();
+  auto* column_lists = pgsql_op_arena_->NewArenaObject<LWPgsqlHashColumnListsPB>();
+  RETURN_NOT_OK(InitHashColumnLists(*partition_column_binds, *column_lists));
+  ArenaList<LWPgsqlExpressionPB> saved_binds(&partition_column_binds->arena());
+  saved_binds.swap(partition_column_binds);
+  const auto restore_binds = ScopeExit([&] {
+    saved_binds.swap(partition_column_binds);
+  });
+  PartitionBatches batches(partition_keys.size());
+  size_t unclassified = batches.size();
+  const auto op_provider = [this]() -> Result<PgsqlReadOp&> { return CloneOnePgsqlOp(); };
+  const auto can_stop = [&batches, &unclassified]() {
+    if (unclassified != 0) {
+      return false;
+    }
+    // A covered tablet with a tighter request range may still be inactive: the classifying
+    // permutation can fall outside that range while a later one falls inside. Keep walking
+    // until every such tablet is activated (or permutations are exhausted).
+    for (const auto& batch : batches) {
+      if (batch.read_op && batch.request_range && !batch.read_op->is_active()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  for (; permutations.HasPermutation() && !can_stop(); ) {
+    RETURN_NOT_OK(ActivatePartitionForPermutation(
+        batches, permutations.NextPermutation(), make_lw_function(op_provider),
+        column_lists, &unclassified));
+  }
+  // Match ClonePgsqlOps on the legacy hash-batch path: one Perform for every covered-tablet op.
+  // ysql_select_parallelism is for range/aggregate scans, not this fan-out.
+  parallelism_level_ = pgsql_ops_.size();
+
+  // A covered tablet whose bounds turn out empty stays inactive. Move it out of the active prefix.
+  MoveInactiveOpsOutside();
+  AddOpsToResultStream();
+
+  return true;
 }
 
 Result<bool> PgDocReadOp::PopulateParallelSelectOps() {

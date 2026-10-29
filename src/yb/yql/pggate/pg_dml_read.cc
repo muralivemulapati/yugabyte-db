@@ -340,6 +340,13 @@ Status PgDmlRead::ProcessEmptyKeyBinds() {
     preceding_key_column_missed = true;
   }
 
+  // A compact request scans many hash keys, so a range equality cannot stay the scan prefix.
+  // It has to move into condition_expr, as it does when hash batching is on.
+  if (!preceding_key_column_missed &&
+      CanPushHashColumnLists(*read_req_, pg_session_->GetIsolationLevel())) {
+    preceding_key_column_missed = true;
+  }
+
   auto range_column_values_it = read_req_->mutable_range_column_values()->begin();
   for (auto index = bind_->num_hash_key_columns(); index < bind_->num_key_columns(); ++index) {
     auto& col = bind_.ColumnForIndex(index);

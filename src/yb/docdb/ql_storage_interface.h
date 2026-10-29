@@ -14,8 +14,10 @@
 #pragma once
 
 #include <limits>
+#include <optional>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "yb/common/common.pb.h"
 #include "yb/common/common_fwd.h"
@@ -32,6 +34,9 @@
 namespace yb::docdb {
 
 using YbctidBounds = std::pair<Slice, Slice>;
+
+// Resume point of a sliced hash-column IN expansion. Defined in doc_pgsql_scanspec.h.
+struct HashColumnListCursor;
 
 // An interface to support various different storage backends for a QL table.
 class YQLStorageIf {
@@ -108,7 +113,11 @@ class YQLStorageIf {
       const dockv::DocKey& start_doc_key,
       std::reference_wrapper<const ScopedRWOperation> pending_op,
       SkipSeek skip_seek,
-      std::unique_ptr<YQLRowwiseIteratorIf>* iter) const = 0;
+      std::unique_ptr<YQLRowwiseIteratorIf>* iter,
+      uint64_t column_list_begin = 0,
+      std::optional<uint64_t> column_list_end = std::nullopt,
+      HashColumnListCursor* column_list_cursor = nullptr,
+      size_t column_list_key_budget = 0) const = 0;
 
   // Create iterator for querying by ybctid.
   virtual Result<std::unique_ptr<YQLRowwiseIteratorIf>> GetIteratorForYbctid(

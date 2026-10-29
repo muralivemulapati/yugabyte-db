@@ -3280,6 +3280,17 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		/* Intended for rolling upgrade scenarios; tied to an auto-flag. */
+		{"yb_push_hash_column_lists_to_docdb", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Push hash column lists to DocDB."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_push_hash_column_lists_to_docdb,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"yb_bypass_cond_recheck", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("DEPRECATED: no-op."),
 			NULL,

@@ -33,6 +33,17 @@ namespace yb::docdb {
 using PgsqlConditionPBPtr = rpc::AnyMessagePtrBase<
     const PgsqlConditionPB*, const LWPgsqlConditionPB*>;
 
+using PgsqlHashColumnListsPBPtr = rpc::AnyMessagePtrBase<
+    const PgsqlHashColumnListsPB*, const LWPgsqlHashColumnListsPB*>;
+
+// One slice of a hash-column IN list: the linear index range [begin, end) over the cartesian
+// product. The last column is the fast digit. exhausted means end is past the last permutation.
+struct HashColumnListCursor {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  bool exhausted = true;
+};
+
 // DocDB variant of scanspec.
 class DocPgsqlScanSpec : public qlexpr::YQLScanSpec {
  public:
@@ -64,7 +75,11 @@ class DocPgsqlScanSpec : public qlexpr::YQLScanSpec {
                    bool is_forward_scan = true,
                    const dockv::DocKey& lower_doc_key = DefaultStartDocKey(),
                    const dockv::DocKey& upper_doc_key = DefaultStartDocKey(),
-                   const size_t prefix_length = 0);
+                   const size_t prefix_length = 0,
+                   PgsqlHashColumnListsPBPtr column_lists = PgsqlHashColumnListsPBPtr(),
+                   uint64_t column_list_begin = 0,
+                   std::optional<uint64_t> column_list_end = std::nullopt,
+                   size_t column_list_key_budget = 0);
 
   DocPgsqlScanSpec(const Schema& schema,
                    const PgsqlConditionPB* condition);
@@ -81,6 +96,8 @@ class DocPgsqlScanSpec : public qlexpr::YQLScanSpec {
   const std::vector<ColumnId>& options_indexes() const override { return options_col_ids_; }
 
   const ColGroupHolder& options_groups() const override { return options_groups_; }
+
+  const HashColumnListCursor& hash_column_list_cursor() const { return hash_column_list_cursor_; }
 
  private:
   static const dockv::DocKey& DefaultStartDocKey();
@@ -103,6 +120,19 @@ class DocPgsqlScanSpec : public qlexpr::YQLScanSpec {
   template <class ConditionPB>
   void InitOptions(const ConditionPB& condition);
 
+  // Expand one slice of PgsqlHashColumnListsPB into the hash option group consumed by
+  // HybridScanChoices. The slice is the linear range [column_list_begin, column_list_end). When
+  // column_list_end is unset, the slice grows until column_list_key_budget permutations have
+  // yb_hash_code in [hash_code_, max_hash_code_]; permutations outside that range are not counted.
+  // A set end is rebuilt as-is, so a resumed slice cannot grow past the range that produced
+  // next_row_key. hash_column_list_cursor_ is that range.
+  template <class HashColumnListsPB>
+  void InitHashColumnLists(
+      const HashColumnListsPB& column_lists,
+      uint64_t column_list_begin,
+      std::optional<uint64_t> column_list_end,
+      size_t column_list_key_budget);
+
   // The range/hash value options if set (possibly more than one due to IN conditions).
   std::shared_ptr<std::vector<qlexpr::OptionList>> options_;
 
@@ -118,6 +148,12 @@ class DocPgsqlScanSpec : public qlexpr::YQLScanSpec {
   // where (r1,r2,r3,r4) is the primary key of this table, then
   // options_groups_ would contain the groups {0,2,3} and {1}.
   ColGroupHolder options_groups_;
+
+  // True when column_lists was set but expanded to no permutations in [hash_code_, max_hash_code_].
+  // CalculateBounds must not treat that as an unconstrained hash-range scan.
+  bool hash_column_lists_empty_ = false;
+
+  HashColumnListCursor hash_column_list_cursor_;
 
   // Hash code is used if encoded_hashed_components vector is empty.
   // hash values are positive int16_t.

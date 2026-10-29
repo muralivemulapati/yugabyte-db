@@ -118,6 +118,8 @@ YB_STRONGLY_TYPED_BOOL(KeepOrder);
 //    - PopulateParallelSelectOps() Parallel processing of aggregate requests or requests with
 //      WHERE expressions filtering rows in DocDB.
 //      The same requests are constructed for each tablet server.
+//    - PopulateHashColumnListsOps() Parallel processing SELECT by hash conditions sent to DocDB
+//      as column_lists. One request per covered tablet.
 //    - PopulateNextHashPermutationOps() Parallel processing SELECT by hash conditions.
 //      Hash permutations will be group into different request based on their hash_codes.
 //    - PopulateByYbctidOps() Parallel processing SELECT by ybctid values.
@@ -486,6 +488,13 @@ class PgDocOp {
   DISALLOW_COPY_AND_ASSIGN(PgDocOp);
 };
 
+// Whether the hash key binds in req.partition_column_values are sent to DocDB as column_lists
+// instead of being expanded into permutations in pggate. PgDmlRead::ProcessEmptyKeyBinds places
+// range key binds and PgDocReadOp picks the request path based on this, so both must use this
+// function.
+[[nodiscard]] bool CanPushHashColumnLists(
+    const LWPgsqlReadRequestPB& req, PgIsolationLevel isolation_level);
+
 class PgDocReadOp : public PgDocOp {
  public:
   PgDocReadOp(const PgSessionPtr& pg_session, PgTable* table, PgsqlReadOpPtr read_op);
@@ -595,16 +604,49 @@ class PgDocReadOp : public PgDocOp {
   Result<bool> BindExprsRegular(
       PgTable& table, LWPgsqlReadRequestPB& read_req, const QLValuePBs& values);
 
+  using ReadOpProvider = LWFunction<Result<PgsqlReadOp&>()>;
+  // Takes the partition op for the tablet of partition_key from read_op_provider on the first
+  // visit, if the template request intersects the partition, then applies the partition bounds
+  // and runs init_fn. Returns nullptr if the partition cannot produce results. If unclassified is
+  // set, it is decremented the first time this partition is classified (covered or skipped).
+  using PartitionOpInitFn = LWFunction<void(PartitionBatch&, LWPgsqlReadRequestPB&)>;
+  Result<PartitionBatch*> EnsurePartitionBatch(
+      PartitionBatches& partition_batches,
+      const std::string& partition_key,
+      const ReadOpProvider& read_op_provider,
+      const PartitionOpInitFn& init_fn,
+      size_t* unclassified = nullptr);
+  // Skips a permutation that lies fully outside the batch's request range, when that range is
+  // narrower than the partition.
+  Result<bool> PermutationInRequestRange(
+      const PartitionBatch& batch, uint16_t hash_code, const QLValuePBs& values);
   // Binds the given values to the partition defined by hash column values.
   // The partition_batches vector for each partition stores the flag indicating the partition
   // has been initialized, and the references to initialized RHSs of the batched IN expression,
   // or null, if the partition batch is inactive.
   // Batch may be inactive if it has not been yet initialized, or its request range is empty.
-  using ReadOpProvider = LWFunction<Result<PgsqlReadOp&>()>;
   Result<bool> BindExprsToBatch(
       PartitionBatches& partition_batches, const QLValuePBs& values,
       const ReadOpProvider& read_op_provider);
   LWPgsqlExpressionPB* InitHashPermutationBatch(LWPgsqlReadRequestPB& read_req);
+
+  // CanPushHashColumnLists() for the template request, computed once and cached so a rescan does
+  // not switch paths if the GUC changes.
+  bool UseHashColumnLists();
+
+  // Routes a hash permutation to its partition op for the column_lists path. Unlike
+  // BindExprsToBatch, this does not materialize the permutation: it only ensures the covered
+  // partition's op is initialized once (ref'ing the shared column_lists) and marks it active.
+  // DocDB expands and filters the hash product per tablet.
+  Result<bool> ActivatePartitionForPermutation(
+      PartitionBatches& partition_batches, const QLValuePBs& values,
+      const ReadOpProvider& read_op_provider,
+      LWPgsqlHashColumnListsPB* column_lists,
+      size_t* unclassified);
+  // Create one operator per tablet covered by the hash permutations, each carrying the shared
+  // column_lists.
+  Result<bool> PopulateHashColumnListsOps();
+
   // Create operators by partitions.
   // - Optimization for aggregating or filtering requests.
   Result<bool> PopulateParallelSelectOps();
@@ -665,6 +707,7 @@ class PgDocReadOp : public PgDocOp {
   // partition_column_values. PgGate makes one batch per tablet.
   std::optional<InPermutationGenerator> hash_permutations_;
   std::optional<bool> is_hash_batched_;
+  std::optional<bool> use_hash_column_lists_;
 };
 
 //--------------------------------------------------------------------------------------------------

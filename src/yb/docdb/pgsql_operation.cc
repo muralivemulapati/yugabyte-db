@@ -453,7 +453,12 @@ Result<YQLRowwiseIteratorIf::UniPtr> CreateIterator(
     const PgsqlReadRequestMsg& request,
     const dockv::ReaderProjection& projection,
     std::reference_wrapper<const DocReadContext> doc_read_context,
-    SkipSeek skip_seek = SkipSeek::kFalse) {
+    SkipSeek skip_seek = SkipSeek::kFalse,
+    bool apply_row_key_paging = true,
+    uint64_t column_list_begin = 0,
+    std::optional<uint64_t> column_list_end = std::nullopt,
+    HashColumnListCursor* column_list_cursor = nullptr,
+    size_t column_list_key_budget = 0) {
   VLOG_IF(2, request.is_for_backfill()) << "Creating iterator for " << AsString(request);
 
   YQLRowwiseIteratorIf::UniPtr result;
@@ -468,7 +473,9 @@ Result<YQLRowwiseIteratorIf::UniPtr> CreateIterator(
     SubDocKey start_sub_doc_key;
     auto actual_read_time = data.read_operation_data.read_time;
     // Decode the start SubDocKey from the paging state and set scan start key.
-    if (request.has_paging_state() &&
+    // A later slice of the same request must not seek to the previous slice's row key.
+    if (apply_row_key_paging &&
+        request.has_paging_state() &&
         request.paging_state().has_next_row_key() &&
         !request.paging_state().next_row_key().empty()) {
       dockv::KeyBytes start_key_bytes(request.paging_state().next_row_key());
@@ -493,7 +500,8 @@ Result<YQLRowwiseIteratorIf::UniPtr> CreateIterator(
     }
     RETURN_NOT_OK(data.ql_storage.GetIterator(
         request, projection, doc_read_context, data.txn_op_context, data.read_operation_data,
-        start_sub_doc_key.doc_key(), data.pending_op, skip_seek, &result));
+        start_sub_doc_key.doc_key(), data.pending_op, skip_seek, &result, column_list_begin,
+        column_list_end, column_list_cursor, column_list_key_budget));
   }
 
   return std::move(result);
@@ -576,11 +584,21 @@ class FilteringIterator {
       const PgsqlReadOperationData& data,
       const PgsqlReadRequestMsg& request,
       const dockv::ReaderProjection& projection,
-      std::reference_wrapper<const DocReadContext> read_context) {
-    RETURN_NOT_OK(InitCommon(request, read_context.get().schema(), projection));
+      std::reference_wrapper<const DocReadContext> read_context,
+      bool apply_row_key_paging = true,
+      uint64_t column_list_begin = 0,
+      std::optional<uint64_t> column_list_end = std::nullopt,
+      HashColumnListCursor* column_list_cursor = nullptr,
+      size_t column_list_key_budget = 0) {
+    // A column-list scan re-inits once per slice. The filter is on the request, not the slice.
+    if (!filter_) {
+      RETURN_NOT_OK(InitCommon(request, read_context.get().schema(), projection));
+    }
     // For an index request the table iterator is positioned by tuple id, see FetchTuple.
     iterator_holder_ = VERIFY_RESULT(CreateIterator(
-        data, request, projection, read_context, SkipSeek(request.has_index_request())));
+        data, request, projection, read_context, SkipSeek(request.has_index_request()),
+        apply_row_key_paging, column_list_begin, column_list_end, column_list_cursor,
+        column_list_key_budget));
     return Status::OK();
   }
 
@@ -2980,10 +2998,25 @@ Result<std::tuple<size_t, bool>> PgsqlReadOperation::ExecuteScalar() {
     SCHECK_NE(idx, Schema::kColumnNotFound, Corruption, "ybidxbasectid not found in index schema");
     index_state.emplace(
         index_schema, request_.index_request(), &index_iter_, index_schema.column_id(idx));
-    RETURN_NOT_OK(index_state->iter.Init(
-        data_, request_.index_request(), index_state->projection, *data_.index_doc_read_context));
-  } else {
-    RETURN_NOT_OK(table_iter.Init(data_, request_, doc_projection, data_.doc_read_context));
+  }
+
+  // Hash-column IN lists live on the request that walks the hash keys. An index scan walks
+  // index_request; the base table is then fetched by ybctid.
+  const PgsqlReadRequestMsg& scan_request = index_state ? request_.index_request() : request_;
+  const bool has_column_lists = scan_request.has_column_lists();
+  // [slice_begin, slice_end) is the linear index range. slice_end is set only when next_row_key
+  // resumes inside a slice that was already bounded; a new slice leaves it unset and grows until
+  // the in-range budget is filled.
+  uint64_t slice_begin = 0;
+  std::optional<uint64_t> slice_end;
+  if (has_column_lists && scan_request.has_paging_state()) {
+    const auto& saved = scan_request.paging_state();
+    if (saved.has_hash_column_list_begin()) {
+      slice_begin = saved.hash_column_list_begin();
+    }
+    if (saved.has_next_row_key() && saved.has_hash_column_list_end()) {
+      slice_end = saved.hash_column_list_end();
+    }
   }
 
   // Set scan end time. We want to iterate as long as we can, but stop before client timeout.
@@ -2996,15 +3029,42 @@ Result<std::tuple<size_t, bool>> PgsqlReadOperation::ExecuteScalar() {
   size_t fetched_rows = 0;
   dockv::PgTableRow row(doc_projection);
   const auto& table_id = request_.index_request().table_id();
+  bool apply_row_key_paging = true;
+  // Set when an index row's base-table row is missing. That ends the request, not just the slice.
+  bool stop_for_missing_row = false;
+  HashColumnListCursor column_list_cursor;
+  const size_t unlimited = std::numeric_limits<size_t>::max();
+  // A slice that leaves the row limit unfilled had keys with no rows. Doubling the floor bounds the
+  // iterators built for a sparse list to O(log keys) instead of one per key under a small limit.
+  size_t min_key_budget = 1;
+  // One slice of column_lists per iteration. A slice that returns fewer rows than the limit is
+  // followed by the next slice in this same request.
+  do {
+    const size_t key_budget = !has_column_lists || row_count_limit == unlimited
+        ? 0
+        : std::max(row_count_limit - fetched_rows, min_key_budget);
+    if (index_state) {
+      RETURN_NOT_OK(index_state->iter.Init(
+          data_, request_.index_request(), index_state->projection, *data_.index_doc_read_context,
+          apply_row_key_paging, slice_begin, slice_end,
+          has_column_lists ? &column_list_cursor : nullptr, key_budget));
+    } else {
+      RETURN_NOT_OK(table_iter.Init(
+          data_, request_, doc_projection, data_.doc_read_context, apply_row_key_paging,
+          slice_begin, slice_end, has_column_lists ? &column_list_cursor : nullptr, key_budget));
+    }
+    apply_row_key_paging = false;
+
   do {
     const auto fetch = VERIFY_RESULT(FetchTableRow(
         table_id, &table_iter, index_state ? &*index_state : nullptr, &row));
     // If changing this code, see also PgsqlReadOperation::ExecuteBatchKeys.
     if (fetch.result == FetchResult::NotFound) {
-      // The scan ends here.  An index row that points at a row missing from the table was read
-      // all the same, so account for it before leaving.
+      // Index-iterator exhaustion ends this slice. A base-table row missing for an index row is
+      // corruption and ends the request; continuing would scan later slices past it.
       if (fetch.read_index_row) {
         ++index_state->scanned_rows;
+        stop_for_missing_row = true;
       }
       break;
     }
@@ -3039,6 +3099,25 @@ Result<std::tuple<size_t, bool>> PgsqlReadOperation::ExecuteScalar() {
     }
   } while (fetch_limit == FetchLimit::kNotReached);
 
+    if (stop_for_missing_row || !has_column_lists || fetch_limit != FetchLimit::kNotReached ||
+        column_list_cursor.exhausted) {
+      break;
+    }
+    // The next slice's keys are not in this iterator. Seeking with the previous slice's row key
+    // would skip keys that sort before it.
+    if (column_list_cursor.end == slice_begin) {
+      YB_LOG_EVERY_N_SECS_OR_VLOG(DFATAL, 60, 1)
+          << "hash column list slice did not advance";
+      break;
+    }
+    slice_begin = column_list_cursor.end;
+    slice_end.reset();
+    // InitHashColumnLists clamps the budget to the 65536-key slice cap, so stop doubling there.
+    if (min_key_budget <= std::numeric_limits<uint16_t>::max()) {
+      min_key_budget *= 2;
+    }
+  } while (true);
+
   // Output aggregate values accumulated while looping over rows
   if (request_.is_aggregate() && match_count > 0) {
     RETURN_NOT_OK(PopulateAggregate(result_buffer_));
@@ -3070,6 +3149,37 @@ Result<std::tuple<size_t, bool>> PgsqlReadOperation::ExecuteScalar() {
     has_paging_state = VERIFY_RESULT(SetPagingState(
         iterator, read_context->schema(), data_.read_operation_data.read_time,
         fetch_limit == FetchLimit::kExceeded ? ReadKey::kCurrent : ReadKey::kNext));
+    if (has_column_lists && (has_paging_state || !column_list_cursor.exhausted)) {
+      auto* paging_state = response_.mutable_paging_state();
+      if (has_paging_state) {
+        // next_row_key is inside this slice. The next page must rebuild the same range: a larger
+        // budget would add keys that sort before next_row_key, and the seek would never read them.
+        paging_state->set_hash_column_list_begin(column_list_cursor.begin);
+        paging_state->set_hash_column_list_end(column_list_cursor.end);
+      } else {
+        // The slice ended on the row limit, so there is no next row key. begin is the next slice.
+        // Without a partition key, InitHashPartitionKey routes the follow-up to the first tablet.
+        paging_state->set_hash_column_list_begin(column_list_cursor.end);
+        // SetPagingState reads the direction from request_. With column_lists set, scan_request is
+        // request_: only colocated, system, and copartitioned indexes embed index_request, and
+        // those have no hash key columns.
+        if (scan_request.is_forward_scan()) {
+          if (scan_request.has_hash_code() && scan_request.hash_code() != 0) {
+            paging_state->dup_next_partition_key(
+                dockv::PartitionSchema::EncodeMultiColumnHashValue(
+                    static_cast<uint16_t>(scan_request.hash_code())));
+          }
+        } else if (scan_request.has_max_hash_code() &&
+                   static_cast<uint16_t>(scan_request.max_hash_code()) !=
+                       dockv::PartitionSchema::kMaxPartitionKey) {
+          paging_state->dup_next_partition_key(
+              dockv::PartitionSchema::EncodeMultiColumnHashValue(
+                  static_cast<uint16_t>(scan_request.max_hash_code()) + 1));
+        }
+        BindReadTimeToPagingState(data_.read_operation_data.read_time);
+        has_paging_state = true;
+      }
+    }
   }
 
   if (index_state) {
