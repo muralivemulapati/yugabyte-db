@@ -24,6 +24,7 @@
 
 #include "yb/docdb/doc_read_context.h"
 #include "yb/docdb/doc_rowwise_iterator.h"
+#include "yb/docdb/doc_pgsql_scanspec.h"
 #include "yb/docdb/doc_ql_scanspec.h"
 #include "yb/docdb/docdb_statistics.h"
 
@@ -199,7 +200,11 @@ Status QLRocksDBStorage::GetIterator(
     const DocKey& start_doc_key,
     std::reference_wrapper<const ScopedRWOperation> pending_op,
     SkipSeek skip_seek,
-    YQLRowwiseIteratorIf::UniPtr* iter) const {
+    YQLRowwiseIteratorIf::UniPtr* iter,
+    uint64_t column_list_begin,
+    std::optional<uint64_t> column_list_end,
+    HashColumnListCursor* column_list_cursor,
+    size_t column_list_key_budget) const {
   const auto& schema = doc_read_context.get().schema();
   // Populate dockey from QL key columns.
   auto arena = SharedSmallArena();
@@ -242,24 +247,31 @@ Status QLRocksDBStorage::GetIterator(
   SCHECK(!request.has_where_expr(),
          InternalError,
          "WHERE clause is not yet supported in docdb::pgsql");
-  RETURN_NOT_OK(doc_iter->Init(
-      DocPgsqlScanSpec(
-          schema,
-          request.stmt_id(),
-          arena,
-          hashed_components,
-          range_components,
-          PgsqlConditionPBPtr(
-                request.has_condition_expr() ? &request.condition_expr().condition() : nullptr),
-          request.hash_code(),
-          request.has_max_hash_code() ? std::make_optional<int32_t>(request.max_hash_code())
-                                      : std::nullopt,
-          start_doc_key,
-          request.is_forward_scan(),
-          lower_doc_key,
-          upper_doc_key,
-          request.prefix_length()),
-      skip_seek));
+  DocPgsqlScanSpec spec(
+      schema,
+      request.stmt_id(),
+      arena,
+      hashed_components,
+      range_components,
+      PgsqlConditionPBPtr(
+            request.has_condition_expr() ? &request.condition_expr().condition() : nullptr),
+      request.hash_code(),
+      request.has_max_hash_code() ? std::make_optional<int32_t>(request.max_hash_code())
+                                  : std::nullopt,
+      start_doc_key,
+      request.is_forward_scan(),
+      lower_doc_key,
+      upper_doc_key,
+      request.prefix_length(),
+      PgsqlHashColumnListsPBPtr(
+            request.has_column_lists() ? &request.column_lists() : nullptr),
+      column_list_begin,
+      column_list_end,
+      column_list_key_budget);
+  if (column_list_cursor != nullptr) {
+    *column_list_cursor = spec.hash_column_list_cursor();
+  }
+  RETURN_NOT_OK(doc_iter->Init(spec, skip_seek));
 
   *iter = std::move(doc_iter);
   return Status::OK();

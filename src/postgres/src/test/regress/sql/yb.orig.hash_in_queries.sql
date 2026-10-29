@@ -1,5 +1,6 @@
 -- Testing IN queries on hash keys
 set yb_enable_hash_batch_in = false;
+set yb_push_hash_column_lists_to_docdb = false;
 CREATE TABLE test_method (h1 int, a int, b int, c int, d int, e int, PRIMARY KEY (h1 HASH));
 INSERT INTO test_method VALUES (1, 1, 1, 1, 1, 11), (2, 1, 1, 2, 2, 12), (19, 1, 2, 1, 3, 13), (3, 1, 2, 2, 4, 14), (4, 2, 1, 1, 5, 15), (5, 2, 1, 2, 6, 16), (6, 2, 2, 1, 7, 17), (7, 2, 2, 2, 8, 18), (8, 2, 999, 2, 8, 18), (9, 0, 1, 1, 9, 19), (10, 1, 1, 2, 10, 20), (11, 3, 1, 1, 1, 11), (12, 3, 1, 2, 2, 12), (13, 3, 2, 1, 3, 13), (14, 3, 2, 2, 4, 14), (15, 4, 1, 1, 1, 11), (16, 4, 1, 2, 2, 12), (17, 4, 2, 1, 3, 13), (18, 4, 2, 2, 4, 14);
 SELECT * FROM test_method where h1 = 1;
@@ -22,6 +23,7 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_m
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND yb_hash_code(h1) >= 64672;
 
 set yb_enable_hash_batch_in = true;
+set yb_push_hash_column_lists_to_docdb = true;
 SELECT * FROM test_method where h1 = 1;
 SELECT * FROM test_method where h1 = 1 AND a = 1;
 SELECT * FROM test_method where h1 = 1 AND b = 2;
@@ -77,6 +79,7 @@ CREATE TABLE test_method (h1 int, h2 int, a int, b int, v1 int, v2 int, PRIMARY 
 INSERT INTO test_method VALUES (1, 1, 1, 1, 1, 11), (2, 1, 1, 2, 2, 12), (19, 1, 2, 1, 3, 13), (3, 1, 2, 2, 4, 14), (4, 2, 1, 1, 5, 15), (5, 2, 1, 2, 6, 16), (6, 2, 2, 1, 7, 17), (7, 2, 2, 2, 8, 18), (8, 2, 999, 2, 8, 18);
 INSERT INTO test_method VALUES (9, 0, 1, 1, 9, 19), (10, 1, 1, 2, 10, 20), (11, 3, 1, 1, 1, 11), (12, 3, 1, 2, 2, 12),   (13, 3, 2, 1, 3, 13), (14, 3, 2, 2, 4, 14), (15, 4, 1, 1, 1, 11), (16, 4, 1, 2, 2, 12), (17, 4, 2, 1, 3, 13), (18, 4, 2, 2, 4, 14);
 set yb_enable_hash_batch_in = false;
+set yb_push_hash_column_lists_to_docdb = false;
 SELECT * FROM test_method where h1 = 1 ;
 SELECT * FROM test_method where h1 = 1 AND h2 = 2;
 SELECT * FROM test_method where h1 = 1 AND h2 = 2 AND a = 1;
@@ -87,6 +90,7 @@ SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2);
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND yb_hash_code(h1, h2) < 8192;
 
 set yb_enable_hash_batch_in = true;
+set yb_push_hash_column_lists_to_docdb = true;
 SELECT * FROM test_method where h1 = 1 ;
 SELECT * FROM test_method where h1 = 1 AND h2 = 2;
 SELECT * FROM test_method where h1 = 1 AND h2 = 2 AND a = 1;
@@ -95,6 +99,20 @@ SELECT * FROM test_method where h1 = 1 AND h2 = 1 AND a IN (1, 2, 3, 4) AND b IN
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2);
 SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2);
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND yb_hash_code(h1, h2) < 8192;
+
+-- Equality on one hash column is a one-element list on the compact path.
+-- Both settings must return the same rows.
+set yb_push_hash_column_lists_to_docdb = false;
+SELECT * FROM test_method where h1 = 1 AND h2 IN (1, 2);
+set yb_push_hash_column_lists_to_docdb = true;
+SELECT * FROM test_method where h1 = 1 AND h2 IN (1, 2);
+
+-- Tuple bind stays on the permutation path. Both settings return the same rows.
+-- (2, 2) is not a stored row; (2, 1) is, and must not be returned.
+set yb_push_hash_column_lists_to_docdb = false;
+SELECT * FROM test_method where ROW(h1, h2) IN (ROW(1, 1), ROW(4, 2), ROW(2, 2)) ORDER BY h1, h2;
+set yb_push_hash_column_lists_to_docdb = true;
+SELECT * FROM test_method where ROW(h1, h2) IN (ROW(1, 1), ROW(4, 2), ROW(2, 2)) ORDER BY h1, h2;
 DROP TABLE test_method;
 
 -- Testing IN queries on multi column range keys
@@ -130,6 +148,7 @@ INSERT INTO test_method VALUES (1, 1, 1, 1, 1, 11), (1, 1, 1, 2, 2, 12), (1, 1, 
 INSERT INTO test_method VALUES (2, 0, 1, 1, 9, 19), (2, 1, 1, 2, 10, 20), (1, 3, 1, 1, 1, 11), (1, 3, 1, 2, 2, 12), (1, 3, 2, 1, 3, 13), (1, 3, 2, 2, 4, 14), (1, 4, 1, 1, 1, 11), (1, 4, 1, 2, 2, 12), (1, 4, 2, 1, 3, 13), (1, 4, 2, 2, 4, 14);
 
 set yb_enable_hash_batch_in = false;
+set yb_push_hash_column_lists_to_docdb = false;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 = 1 ;
 SELECT * FROM test_method where h1 = 1 ;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 = 1 AND h2 = 2;
@@ -154,6 +173,7 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_m
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND r1 IN (1, 2, 3, 4) AND r2 IN (1, 2, 3, 4) AND yb_hash_code(h1, h2) < 8192;
 
 set yb_enable_hash_batch_in = true;
+set yb_push_hash_column_lists_to_docdb = true;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 = 1 ;
 SELECT * FROM test_method where h1 = 1 ;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 = 1 AND h2 = 2;
@@ -176,17 +196,24 @@ EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_m
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND r1 = 1 AND yb_hash_code(h1, h2) < 8192;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND r1 = 1 AND r2 = 2 AND yb_hash_code(h1, h2) < 8192;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND r1 IN (1, 2, 3, 4) AND r2 IN (1, 2, 3, 4) AND yb_hash_code(h1, h2) < 8192;
+
+-- Compact lists with hash batching off. A range equality must filter every hash key, not only the
+-- ends of the scan window.
+set yb_enable_hash_batch_in = false;
+set yb_push_hash_column_lists_to_docdb = true;
+SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND r1 = 1 ORDER BY h1, h2, r2;
+SELECT * FROM test_method where h1 IN (1, 2, 3, 4) AND h2 IN (1, 2) AND r1 = 1 AND r2 = 2 ORDER BY h1, h2, r2;
+set yb_enable_hash_batch_in = true;
 DROP TABLE test_method;
 
 CREATE TABLE test_method (h1 int, h2 int, h3 int, h4 int, v1 int, v2 int, PRIMARY KEY ((h1, h2, h3, h4) HASH));
 INSERT INTO test_method VALUES (1, 1, 1, 1, 1, 11), (1, 1, 1, 2, 2, 12), (1, 1, 2, 1, 3, 13), (1, 1, 2, 2, 4, 14), (1, 2, 1, 1, 5, 15), (1, 2, 1, 2, 6, 16), (1, 2, 2, 1, 7, 17), (1, 2, 2, 2, 8, 18), (1, 2, 999, 2, 8, 18);
 INSERT INTO test_method VALUES (2, 0, 1, 1, 9, 19), (2, 1, 1, 2, 10, 20), (1, 3, 1, 1, 1, 11), (1, 3, 1, 2, 2, 12), (1, 3, 2, 1, 3, 13), (1, 3, 2, 2, 4, 14), (1, 4, 1, 1, 1, 11), (1, 4, 1, 2, 2, 12), (1, 4, 2, 1, 3, 13), (1, 4, 2, 2, 4, 14);
--- Set a high work_mem limit so we don't limit the size of each request batch
+-- Compact column_lists keep the full cartesian IN in one round-trip even at
+-- low work_mem (the legacy permutation path flushed batches here).
 SET work_mem = 2147483647;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method WHERE h1 IN (1,2,3,4,5,6,7,8,9,0) AND h2 IN (1,2,3,4,5,6,7,8,9,0) AND h3 IN (1,2,3,4,5,6,7,8,9,0) AND h4 IN (1,2,3,4,5,6,7,8,9,0);
 
--- Set a low work_mem limit so we limit the size of each request batch and cause
--- more requests to be sent out.
 SET work_mem = 64;
 EXPLAIN (ANALYZE, DIST, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT * FROM test_method WHERE h1 IN (1,2,3,4,5,6,7,8,9,0) AND h2 IN (1,2,3,4,5,6,7,8,9,0) AND h3 IN (1,2,3,4,5,6,7,8,9,0) AND h4 IN (1,2,3,4,5,6,7,8,9,0);
 DROP TABLE test_method;
@@ -268,3 +295,77 @@ SELECT yb_hash_code(h), * FROM test_31027 WHERE h IN (110359, 262095);
 
 reset yb_allow_dockey_bounds;
 DROP TABLE test_31027;
+
+-- Forced parallel scan with a hash IN. Each parallel range rebuilds its requests
+-- from the same template, so the hash binds must survive the first range. A lost
+-- bind scans the later ranges unconstrained and returns extra rows.
+CREATE TABLE test_parallel_hash_in (k int, c int, v int, PRIMARY KEY (k HASH)) SPLIT INTO 3 TABLETS;
+CREATE INDEX ON test_parallel_hash_in (c HASH) SPLIT INTO 3 TABLETS;
+INSERT INTO test_parallel_hash_in SELECT i, i % 50, i FROM generate_series(1, 400) i;
+ANALYZE test_parallel_hash_in;
+set yb_enable_cbo = on;
+set yb_enable_parallel_scan_hash_sharded = on;
+set yb_parallel_range_rows = 1;
+set yb_parallel_range_size = 1024;
+set yb_test_force_parallel = force;
+-- The hints keep ORDER BY from turning the plan into a parallel seq scan.
+\set QC '/*+ IndexScan(test_parallel_hash_in test_parallel_hash_in_c_idx) */'
+\set QK '/*+ IndexScan(test_parallel_hash_in test_parallel_hash_in_pkey) */'
+:QC EXPLAIN (COSTS OFF) SELECT k, c FROM test_parallel_hash_in WHERE c IN (10, 20) ORDER BY k;
+set yb_push_hash_column_lists_to_docdb = false;
+:QC SELECT k, c FROM test_parallel_hash_in WHERE c IN (10, 20) ORDER BY k;
+set yb_push_hash_column_lists_to_docdb = true;
+:QC SELECT k, c FROM test_parallel_hash_in WHERE c IN (10, 20) ORDER BY k;
+:QK EXPLAIN (COSTS OFF) SELECT k, v FROM test_parallel_hash_in WHERE k IN (5, 105, 205, 305) ORDER BY k;
+set yb_push_hash_column_lists_to_docdb = false;
+:QK SELECT k, v FROM test_parallel_hash_in WHERE k IN (5, 105, 205, 305) ORDER BY k;
+set yb_push_hash_column_lists_to_docdb = true;
+:QK SELECT k, v FROM test_parallel_hash_in WHERE k IN (5, 105, 205, 305) ORDER BY k;
+reset yb_enable_parallel_scan_hash_sharded;
+reset yb_parallel_range_rows;
+reset yb_parallel_range_size;
+reset yb_test_force_parallel;
+reset yb_enable_cbo;
+DROP TABLE test_parallel_hash_in;
+
+-- IN values that hash to only some tablets. A tablet with no matching
+-- permutation must return nothing, not every row it holds.
+CREATE TABLE test_empty_hash_group (h int, v int, PRIMARY KEY (h HASH)) SPLIT INTO 3 TABLETS;
+INSERT INTO test_empty_hash_group SELECT i, i FROM generate_series(1, 30) i;
+set yb_enable_hash_batch_in = true;
+set yb_push_hash_column_lists_to_docdb = false;
+SELECT h, v FROM test_empty_hash_group WHERE h IN (1, 2, 3) ORDER BY h;
+set yb_push_hash_column_lists_to_docdb = true;
+SELECT h, v FROM test_empty_hash_group WHERE h IN (1, 2, 3) ORDER BY h;
+DROP TABLE test_empty_hash_group;
+
+-- Two-column IN lists whose lengths are not multiples of 32, read over
+-- several pages on several tablets. Each key has one row, so a page often ends
+-- exactly on a slice boundary and the next page must return to the same tablet.
+-- Then keys get zero, one, or two rows, so a page also stops inside a slice
+-- that a smaller budget produced. Every run must match the legacy path.
+CREATE TABLE test_hash_in_slices (h1 int, h2 int, r int, PRIMARY KEY ((h1, h2) HASH, r ASC)) SPLIT INTO 3 TABLETS;
+INSERT INTO test_hash_in_slices SELECT h1, h2, 1 FROM generate_series(1, 40) h1, generate_series(1, 40) h2;
+\set H '/*+ IndexScan(test_hash_in_slices) */'
+\set Q 'SELECT count(*), sum(h1 * 100000 + h2 * 100 + r) FROM (SELECT h1, h2, r FROM test_hash_in_slices WHERE h1 = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]) AND h2 = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]) OFFSET 0) s;'
+set yb_push_hash_column_lists_to_docdb = false;
+:H :Q
+set yb_push_hash_column_lists_to_docdb = true;
+:H :Q
+set yb_fetch_row_limit = 100;
+:H :Q
+set yb_fetch_row_limit = 37;
+:H :Q
+reset yb_fetch_row_limit;
+DELETE FROM test_hash_in_slices WHERE (h1 + h2) % 3 = 0;
+INSERT INTO test_hash_in_slices SELECT h1, h2, 2 FROM generate_series(1, 40) h1, generate_series(1, 40) h2 WHERE (h1 + h2) % 3 = 2;
+set yb_push_hash_column_lists_to_docdb = false;
+:H :Q
+set yb_push_hash_column_lists_to_docdb = true;
+:H :Q
+set yb_fetch_row_limit = 100;
+:H :Q
+set yb_fetch_row_limit = 37;
+:H :Q
+reset yb_fetch_row_limit;
+DROP TABLE test_hash_in_slices;

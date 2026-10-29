@@ -2316,13 +2316,28 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
   }
 
   static final Pattern roundtrips_pattern = Pattern.compile("Storage Read Requests: (\\d+)\\s*$");
+  static final Pattern storage_read_ops_pattern = Pattern.compile("Storage Read Ops: (\\d+)\\s*$");
+  static final Pattern storage_rows_scanned_pattern =
+      Pattern.compile("Storage Rows Scanned: (\\d+)\\s*$");
 
   protected Long getNumStorageRoundtrips(Statement stmt, String query) throws Exception {
+    return getExplainDistMetric(stmt, query, roundtrips_pattern);
+  }
+
+  protected Long getNumStorageReadOps(Statement stmt, String query) throws Exception {
+    return getExplainDistMetric(stmt, query, storage_read_ops_pattern);
+  }
+
+  protected Long getNumStorageRowsScanned(Statement stmt, String query) throws Exception {
+    return getExplainDistMetric(stmt, query, storage_rows_scanned_pattern);
+  }
+
+  private Long getExplainDistMetric(Statement stmt, String query, Pattern pattern)
+      throws Exception {
     try (ResultSet rs = stmt.executeQuery(
         "EXPLAIN (ANALYZE, DIST, COSTS OFF, TIMING OFF) " + query)) {
       while (rs.next()) {
-        String line = rs.getString(1);
-        Matcher m = roundtrips_pattern.matcher(line);
+        Matcher m = pattern.matcher(rs.getString(1));
         if (m.find()) {
           return Long.parseLong(m.group(1));
         }

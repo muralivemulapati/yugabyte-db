@@ -15,6 +15,7 @@
 #include <string>
 
 #include "yb/common/pgsql_protocol.pb.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
 #include "yb/docdb/doc_pgsql_scanspec.h"
@@ -27,8 +28,10 @@
 
 #include "yb/gutil/casts.h"
 
+#include "yb/util/memory/arena.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+#include "yb/util/yb_partition.h"
 
 using std::string;
 
@@ -469,6 +472,51 @@ TEST_F(ScanChoicesTest, MixedTupleFilterHybridScan) {
       conds,
       {{{11, 13, 9, 3, 12, 11}, {11, 14, 9, 3, 10, 10}},
        {{12, 11, 4, 23, 14, 22}, {12, 11, 4, 23, 14, 12}}});
+}
+
+// A tablet whose hash range holds none of the column_lists permutations must scan nothing.
+// Bloom filter setup in ScanChoices::Create decodes the bounds as doc keys, so they must decode.
+TEST_F(ScanChoicesTest, HashColumnListsNoPermutationInTablet) {
+  const Schema schema(
+      {ColumnSchema("h", DataType::INT32, ColumnKind::HASH),
+       ColumnSchema("r", DataType::INT32, ColumnKind::RANGE_ASC_NULL_FIRST),
+       ColumnSchema("payload", DataType::INT32, ColumnKind::VALUE, Nullable::kTrue)},
+      {10_ColId, 11_ColId, 12_ColId});
+  const auto doc_read_context = DocReadContext::TEST_Create(schema);
+
+  PgsqlHashColumnListsPB column_lists;
+  auto* value = column_lists.add_column_list()->mutable_list_value()->add_elems();
+  value->set_int32_value(1);
+  std::string compound;
+  AppendToKey(*value, &compound);
+  const uint16_t permutation_hash = YBPartition::HashColumnCompoundValue(compound);
+  const int32_t tablet_hash = permutation_hash == 0 ? 1 : permutation_hash - 1;
+
+  const auto encode_row = [&schema](uint16_t hash) {
+    return DocKey(
+        schema, hash, {KeyEntryValue::Int32(1)}, {KeyEntryValue::Int32(1)}).Encode();
+  };
+  const auto min_row = encode_row(YBPartition::kMinHashCode);
+  const auto max_row = encode_row(YBPartition::kMaxHashCode);
+
+  for (const bool is_forward_scan : {true, false}) {
+    SCOPED_TRACE(Format("is_forward_scan: $0", is_forward_scan));
+    dockv::KeyEntryValues empty_components;
+    DocPgsqlScanSpec spec(
+        schema, rocksdb::kDefaultQueryId, SharedSmallArena(), {}, empty_components,
+        /* condition= */ nullptr, tablet_hash, tablet_hash, DocKey(), is_forward_scan,
+        DocKey(), DocKey(), /* prefix_length= */ 0, PgsqlHashColumnListsPBPtr(&column_lists));
+    const auto& bounds = spec.bounds();
+    auto choices = ASSERT_RESULT(ScanChoices::Create(
+        doc_read_context, spec, bounds, {}, AllowVariableBloomFilter::kFalse));
+    ASSERT_NE(choices, nullptr);
+
+    // Rows at either end of the hash space fall outside [lower, upper).
+    ASSERT_GE(min_row, bounds.upper);
+    ASSERT_GE(max_row, bounds.upper);
+    ASSERT_LT(min_row, bounds.lower);
+    ASSERT_LT(max_row, bounds.lower);
+  }
 }
 
 }  // namespace docdb

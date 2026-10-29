@@ -123,6 +123,12 @@ extern bool yb_run_with_explain_analyze;
 extern bool yb_enable_hash_batch_in;
 
 /*
+ * GUC variable that enables sending hash column lists to DocDB on
+ * PgsqlReadRequestPB. Tied to an auto-flag for rolling upgrades.
+ */
+extern bool yb_push_hash_column_lists_to_docdb;
+
+/*
  * GUC variable that enables using the default value for existing rows after
  * an ADD COLUMN ... DEFAULT operation.
  */

@@ -76,7 +76,11 @@ class QLRocksDBStorage : public YQLStorageIf {
       const dockv::DocKey& start_doc_key,
       std::reference_wrapper<const ScopedRWOperation> pending_op,
       SkipSeek skip_seek,
-      YQLRowwiseIteratorIf::UniPtr* iter) const override;
+      YQLRowwiseIteratorIf::UniPtr* iter,
+      uint64_t column_list_begin = 0,
+      std::optional<uint64_t> column_list_end = std::nullopt,
+      HashColumnListCursor* column_list_cursor = nullptr,
+      size_t column_list_key_budget = 0) const override;
 
   Result<std::unique_ptr<YQLRowwiseIteratorIf>> GetIteratorForYbctid(
       uint64 stmt_id,

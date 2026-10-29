@@ -27,6 +27,7 @@
 
 #include "yb/util/logging.h"
 #include "yb/util/status_format.h"
+#include "yb/util/yb_partition.h"
 
 namespace yb::docdb {
 
@@ -39,7 +40,10 @@ namespace {
 
 const dockv::KeyEntryValues kEmptyKeyComponents;
 
-}
+// Cap on the encoded keys one slice holds at once.
+constexpr size_t kHashColumnListSliceCap = static_cast<size_t>(YBPartition::kMaxHashCode) + 1;
+
+}  // namespace
 
 DocPgsqlScanSpec::DocPgsqlScanSpec(
     const Schema& schema,
@@ -100,7 +104,11 @@ DocPgsqlScanSpec::DocPgsqlScanSpec(
     bool is_forward_scan,
     const DocKey& lower_doc_key,
     const DocKey& upper_doc_key,
-    const size_t prefix_length)
+    const size_t prefix_length,
+    PgsqlHashColumnListsPBPtr column_lists,
+    uint64_t column_list_begin,
+    std::optional<uint64_t> column_list_end,
+    size_t column_list_key_budget)
     : YQLScanSpec(
           YQL_CLIENT_PGSQL, schema, is_forward_scan, query_id,
           qlexpr::QLScanRange::Create(schema, condition),
@@ -135,6 +143,23 @@ DocPgsqlScanSpec::DocPgsqlScanSpec(
 
       (*options_)[schema.get_dockey_component_idx(col_idx)].push_back(
           encoded_hashed_components[col_idx]);
+    }
+  }
+
+  // Per-column hash-key value lists to be expanded by DocDB into the hash option group. This is
+  // mutually exclusive with encoded_hashed_components (a fixed hash key) being set.
+  if (column_lists != nullptr) {
+    DCHECK(encoded_hashed_components.empty());
+    if (options_ == nullptr) {
+      options_ = std::make_shared<std::vector<qlexpr::OptionList>>(schema.num_dockey_components());
+      options_col_ids_.reserve(schema.num_dockey_components());
+    }
+    if (column_lists.is_lightweight()) {
+      InitHashColumnLists(
+          *column_lists.lightweight(), column_list_begin, column_list_end, column_list_key_budget);
+    } else {
+      InitHashColumnLists(
+          *column_lists.protobuf(), column_list_begin, column_list_end, column_list_key_budget);
     }
   }
 
@@ -368,8 +393,199 @@ void DocPgsqlScanSpec::InitOptions(const ConditionPB& condition) {
   }
 }
 
+template <class HashColumnListsPB>
+void DocPgsqlScanSpec::InitHashColumnLists(
+    const HashColumnListsPB& column_lists,
+    uint64_t column_list_begin,
+    std::optional<uint64_t> column_list_end,
+    size_t column_list_key_budget) {
+  const size_t num_hash = schema().num_hash_key_columns();
+  if (num_hash == 0) {
+    YB_LOG_EVERY_N_SECS_OR_VLOG(DFATAL, 60, 1)
+        << "column_lists set on a table without hash key columns";
+    return;
+  }
+
+  // Pointer-to-value type (const QLValuePB* or const LWQLValuePB*) deduced from list elems.
+  using ValuePtr = decltype(&*column_lists.column_list().begin()->list_value().elems().begin());
+
+  // Collect the candidate values for each hash key column, in hash-key order. Each column_list
+  // entry is a list_value (equality is a single-element list).
+  std::vector<std::vector<ValuePtr>> col_values;
+  col_values.reserve(num_hash);
+  for (const auto& list_val : column_lists.column_list()) {
+    std::vector<ValuePtr> values;
+    for (const auto& elem : list_val.list_value().elems()) {
+      values.push_back(&elem);
+    }
+    col_values.push_back(std::move(values));
+  }
+
+  if (col_values.size() != num_hash) {
+    YB_LOG_EVERY_N_SECS_OR_VLOG(DFATAL, 60, 1)
+        << "column_lists has " << col_values.size() << " columns, expected " << num_hash;
+    hash_column_lists_empty_ = true;
+    return;
+  }
+
+  // This tablet's inclusive hash range. Permutations whose yb_hash_code lands outside this range
+  // belong to other tablets and are filtered out here.
+  const uint16_t lo = hash_code_ ? static_cast<uint16_t>(*hash_code_) : YBPartition::kMinHashCode;
+  const uint16_t hi =
+      max_hash_code_ ? static_cast<uint16_t>(*max_hash_code_) : YBPartition::kMaxHashCode;
+
+  // One encoded permutation: encoded[0] is yb_hash_code, encoded[1 + c] is the c-th hash column.
+  struct EncodedPermutation {
+    std::vector<Slice> encoded;
+  };
+  std::vector<EncodedPermutation> permutations;
+
+  bool any_empty = false;
+  for (const auto& values : col_values) {
+    any_empty = any_empty || values.empty();
+  }
+  // An empty per-column list is a malformed request. A tablet whose range simply contains none of
+  // the permutations also ends with an empty expansion, and that scan returns no rows.
+  if (any_empty) {
+    YB_LOG_EVERY_N_SECS_OR_VLOG(DFATAL, 60, 1) << "column_lists has an empty hash column list";
+    hash_column_lists_empty_ = true;
+    return;
+  }
+
+  // Linear index of the cartesian product. The last column is the fast digit, so consecutive
+  // indexes tile the lists: the next slice starts where this one ended.
+  std::vector<uint64_t> sizes;
+  sizes.reserve(num_hash);
+  uint64_t product = 1;
+  for (const auto& values : col_values) {
+    const auto size = static_cast<uint64_t>(values.size());
+    if (product > std::numeric_limits<uint64_t>::max() / size) {
+      YB_LOG_EVERY_N_SECS_OR_VLOG(DFATAL, 60, 1)
+          << "hash column list product does not fit in uint64";
+      hash_column_lists_empty_ = true;
+      return;
+    }
+    product *= size;
+    sizes.push_back(size);
+  }
+
+  hash_column_list_cursor_.begin = column_list_begin;
+  if (column_list_begin > product ||
+      (column_list_end.has_value() && *column_list_end < column_list_begin)) {
+    YB_LOG_EVERY_N_SECS_OR_VLOG(DFATAL, 60, 1)
+        << "hash column list slice [" << column_list_begin << ", "
+        << column_list_end.value_or(product) << ") is outside [0, " << product << ")";
+    hash_column_list_cursor_.end = column_list_begin;
+    hash_column_list_cursor_.exhausted = true;
+    hash_column_lists_empty_ = true;
+    return;
+  }
+
+  // A fixed end is the slice that produced next_row_key. Growing it would add keys that sort
+  // before that row and the seek would skip them. An open end runs until `budget` keys fall in
+  // this tablet; keys for other tablets do not consume the budget.
+  const bool grow = !column_list_end.has_value();
+  const uint64_t limit_end = std::min(column_list_end.value_or(product), product);
+  size_t budget = column_list_key_budget;
+  if (budget == 0 || budget > kHashColumnListSliceCap) {
+    budget = kHashColumnListSliceCap;
+  }
+
+  std::vector<size_t> pos(num_hash);
+  std::string compound;
+  size_t in_range = 0;
+  uint64_t index = column_list_begin;
+  while (index < limit_end) {
+    uint64_t rest = index;
+    for (size_t c = num_hash; c-- > 0; ) {
+      pos[c] = static_cast<size_t>(rest % sizes[c]);
+      rest /= sizes[c];
+    }
+
+    // AppendToKey mirrors how the partition schema (and pggate) builds the hash compound value.
+    compound.clear();
+    for (size_t c = 0; c < num_hash; ++c) {
+      AppendToKey(*col_values[c][pos[c]], &compound);
+    }
+    const uint16_t hash_code = YBPartition::HashColumnCompoundValue(compound);
+    ++index;
+    if (hash_code < lo || hash_code > hi) {
+      continue;
+    }
+
+    EncodedPermutation permutation;
+    permutation.encoded.reserve(num_hash + 1);
+    permutation.encoded.push_back(dockv::EncodedHashCode(arena(), hash_code));
+    for (size_t c = 0; c < num_hash; ++c) {
+      permutation.encoded.push_back(dockv::EncodedKeyEntryValue(
+          arena(), *col_values[c][pos[c]], get_sorting_type(c)));
+    }
+    permutations.push_back(std::move(permutation));
+    if (grow && ++in_range == budget) {
+      break;
+    }
+  }
+
+  hash_column_list_cursor_.end = index;
+  hash_column_list_cursor_.exhausted = index >= product;
+
+  // Sort permutations into scan order. The encoded slices are order-preserving (yb_hash_code is
+  // big-endian; hash columns use their key sorting type), so lexicographic comparison of the
+  // encoded components yields key order; flip the sense for a reverse scan. This matches the
+  // ordering produced by the legacy ROW(yb_hash_code, ...) IN tuple path.
+  const bool forward = is_forward_scan();
+  std::sort(permutations.begin(), permutations.end(),
+            [forward](const EncodedPermutation& a, const EncodedPermutation& b) {
+    for (size_t i = 0; i < a.encoded.size(); ++i) {
+      const int cmp = a.encoded[i].compare(b.encoded[i]);
+      if (cmp != 0) {
+        return forward ? cmp < 0 : cmp > 0;
+      }
+    }
+    return false;
+  });
+
+  // No permutation hashed into this tablet. Registering an empty option group makes
+  // CalculateBounds treat the scan as unconstrained.
+  if (permutations.empty()) {
+    hash_column_lists_empty_ = true;
+    return;
+  }
+
+  // Register the hash option group: yb_hash_code followed by the hash key columns, all correlated
+  // in a single group (each permutation is one option across these columns).
+  options_groups_.BeginNewGroup();
+  options_groups_.AddToLatestGroup(0);
+  options_col_ids_.emplace_back(ColumnId(kYbHashCodeColId));
+  for (size_t c = 0; c < num_hash; ++c) {
+    options_groups_.AddToLatestGroup(schema().get_dockey_component_idx(c));
+    options_col_ids_.emplace_back(schema().column_id(c));
+  }
+
+  for (const auto& permutation : permutations) {
+    (*options_)[0].push_back(permutation.encoded[0]);
+    for (size_t c = 0; c < num_hash; ++c) {
+      (*options_)[schema().get_dockey_component_idx(c)].push_back(permutation.encoded[c + 1]);
+    }
+  }
+}
+
 qlexpr::ScanBounds DocPgsqlScanSpec::CalculateBounds(
     const std::vector<Slice>& encoded_hashed_components, const Schema& schema) const {
+  if (hash_column_lists_empty_) {
+    // No permutation falls in this tablet. Lower is +inf so a backward scan is already past every
+    // row. The forward scan uses the upper bound as its iterator bound, which must start with the
+    // table prefix (cotable or colocation id, then the hash-code marker). A bare kLowest fails
+    // that check. The upper bound carries a full hash code because bloom filter setup decodes it
+    // as a doc key. Every row key extends prefix + hash code 0, so the exclusive upper bound
+    // excludes them all.
+    qlexpr::ScanBounds bounds;
+    bounds.lower.AppendKeyEntryType(KeyEntryType::kHighest);
+    dockv::DocKeyEncoder(&bounds.upper).Schema(schema);
+    AppendHash(0, &bounds.upper);
+    return bounds;
+  }
+
   bool has_hash_columns = schema.num_hash_key_columns() > 0;
 
   // The first column in a hash partitioned table is the hash code column.
