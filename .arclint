@@ -194,7 +194,8 @@
     "postgres": {
       "type": "script-and-regex",
       "exclude": [
-        "(^src/yb/)"
+        "(^src/yb/)",
+        "(^sample/)"
       ],
       "include": [
         "([.]c$)",

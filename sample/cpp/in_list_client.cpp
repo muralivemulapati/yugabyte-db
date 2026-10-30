@@ -1,3 +1,15 @@
+// Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License. You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under
+// the License.
+//
 // YSQL client for HASH-sharded varchar IN-list latency tests.
 // Default connection is the portal.dev universe murali-d58130 (client-to-node TLS).
 //
@@ -500,7 +512,7 @@ void PrintInStyle(const Options& o) {
   }
 }
 
-bool TakePrefixedLong(const std::string& line, const char* key, std::optional<long>& dest) {
+bool TakePrefixedLong(const std::string& line, const char* key, std::optional<int64_t>& dest) {
   if (dest) return false;
   const std::string needle = std::string(key) + ":";
   const auto pos = line.find(needle);
@@ -510,7 +522,7 @@ bool TakePrefixedLong(const std::string& line, const char* key, std::optional<lo
     ++p;
   }
   char* end = nullptr;
-  const long v = std::strtol(p, &end, 10);
+  const int64_t v = std::strtoll(p, &end, 10);
   if (end == p) return false;
   dest = v;
   return true;
@@ -533,25 +545,25 @@ bool TakePrefixedDouble(const std::string& line, const char* key, std::optional<
 }
 
 struct DistMetrics {
-  std::optional<long> table_read_requests;
-  std::optional<long> read_requests;
-  std::optional<long> table_read_ops;
-  std::optional<long> read_ops;
-  std::optional<long> table_rows_scanned;
-  std::optional<long> rows_scanned;
+  std::optional<int64_t> table_read_requests;
+  std::optional<int64_t> read_requests;
+  std::optional<int64_t> table_read_ops;
+  std::optional<int64_t> read_ops;
+  std::optional<int64_t> table_rows_scanned;
+  std::optional<int64_t> rows_scanned;
   std::optional<double> exec_ms;
 
-  long Requests() const {
+  int64_t Requests() const {
     if (table_read_requests) return *table_read_requests;
     if (read_requests) return *read_requests;
     return -1;
   }
-  long Ops() const {
+  int64_t Ops() const {
     if (table_read_ops) return *table_read_ops;
     if (read_ops) return *read_ops;
     return -1;
   }
-  long RowsScanned() const {
+  int64_t RowsScanned() const {
     if (table_rows_scanned) return *table_rows_scanned;
     if (rows_scanned) return *rows_scanned;
     return -1;
@@ -574,7 +586,7 @@ DistMetrics ParseDistMetrics(PGresult* res) {
   return m;
 }
 
-std::string FmtMetric(long v) { return v < 0 ? std::string("-") : std::to_string(v); }
+std::string FmtMetric(int64_t v) { return v < 0 ? std::string("-") : std::to_string(v); }
 
 void PrintPlan(PGresult* res) {
   const int n = PQntuples(res);
@@ -618,8 +630,10 @@ void RunQuery(PGconn* conn, const Options& o) {
   const double sum = std::accumulate(lat_ms.begin(), lat_ms.end(), 0.0);
   const double avg = sum / static_cast<double>(lat_ms.size());
   std::cout << std::fixed << std::setprecision(3)
-            << "latency_ms  n=" << lat_ms.size() << "  min=" << *std::min_element(lat_ms.begin(), lat_ms.end())
-            << "  p50=" << Percentile(lat_ms, 0.50) << "  p95=" << Percentile(lat_ms, 0.95)
+            << "latency_ms  n=" << lat_ms.size()
+            << "  min=" << *std::min_element(lat_ms.begin(), lat_ms.end())
+            << "  p50=" << Percentile(lat_ms, 0.50)
+            << "  p95=" << Percentile(lat_ms, 0.95)
             << "  p99=" << Percentile(lat_ms, 0.99) << "  avg=" << avg
             << "  max=" << *std::max_element(lat_ms.begin(), lat_ms.end()) << std::endl;
 }
@@ -700,7 +714,8 @@ int main(int argc, char** argv) {
   const Options o = ParseArgs(argc, argv);
   PGconn* conn = Connect(o);
   std::cout << "connected to " << PQhost(conn) << ":" << PQport(conn) << " db=" << PQdb(conn)
-            << " user=" << PQuser(conn) << " ssl=" << (PQsslInUse(conn) ? "yes" : "no") << std::endl;
+            << " user=" << PQuser(conn)
+            << " ssl=" << (PQsslInUse(conn) ? "yes" : "no") << std::endl;
   try {
     if (o.mode == "create-schema") {
       CreateSchema(conn, o);
