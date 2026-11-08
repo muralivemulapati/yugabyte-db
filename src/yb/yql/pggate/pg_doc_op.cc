@@ -15,6 +15,7 @@
 #include "yb/yql/pggate/pg_doc_op.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "yb/ash/wait_state.h"
 
@@ -223,6 +224,19 @@ size_t HashInValueCount(const LWPgsqlExpressionPB& expr) {
     return 1;
   }
   return operands.back().condition().operands().size();
+}
+
+// The column_lists path walks at most this factor times T ln T hash permutations (T tablets) to
+// find the covered tablets, then fans out to the tablets not reached yet.
+constexpr double kHashColumnListsWalkCapFactor = 3.0;
+
+// Drop the copied hash binds on a clone and point it at the shared column_lists. DocDB expands
+// column_lists; leaving partition_column_values would keep the legacy permutation path on the same
+// request.
+void AttachHashColumnLists(
+    LWPgsqlReadRequestPB& read_req, LWPgsqlHashColumnListsPB* column_lists) {
+  read_req.clear_partition_column_values();
+  read_req.ref_column_lists(column_lists);
 }
 
 } // namespace
@@ -1398,10 +1412,7 @@ Result<bool> PgDocReadOp::ActivatePartitionForPermutation(
   std::span hash_values(values.begin(), table_->num_hash_key_columns());
   auto partition_key = VERIFY_RESULT(table_->partition_schema().EncodePgsqlHash(hash_values));
   const auto init_fn = [column_lists](PartitionBatch& /*batch*/, LWPgsqlReadRequestPB& read_req) {
-    // Drop the copied hash binds on the clone. DocDB expands column_lists; leaving
-    // partition_column_values would keep the legacy permutation path on the same request.
-    read_req.clear_partition_column_values();
-    read_req.ref_column_lists(column_lists);
+    AttachHashColumnLists(read_req, column_lists);
   };
   auto* partition_batch = VERIFY_RESULT(EnsurePartitionBatch(
       partition_batches, partition_key, read_op_provider, make_lw_function(init_fn), unclassified));
@@ -1457,10 +1468,40 @@ Result<bool> PgDocReadOp::PopulateHashColumnListsOps() {
     }
     return true;
   };
-  for (; permutations.HasPermutation() && !can_stop(); ) {
+  // Pruning walks permutations until every tablet is classified. With T tablets that takes
+  // ~T ln T permutations on average (coupon collector), but it takes the whole product when some
+  // tablet gets no permutation. Past the cap, the chance that a tablet is still unhit is ~1/T^2,
+  // so stop walking and fan out to every tablet left. That is safe: DocDB expands column_lists
+  // per tablet and a tablet with no matching permutation returns no rows.
+  const size_t num_partitions = partition_keys.size();
+  const auto walk_cap = static_cast<uint64_t>(std::ceil(
+      kHashColumnListsWalkCapFactor * num_partitions *
+      std::log(static_cast<double>(std::max<size_t>(num_partitions, 2)))));
+  uint64_t walked = 0;
+  for (; permutations.HasPermutation() && !can_stop() && walked < walk_cap; ++walked) {
     RETURN_NOT_OK(ActivatePartitionForPermutation(
         batches, permutations.NextPermutation(), make_lw_function(op_provider),
         column_lists, &unclassified));
+  }
+  if (permutations.HasPermutation() && !can_stop()) {
+    VLOG(2) << "Hash column lists: walked " << walked << " permutations over " << num_partitions
+            << " tablets, " << unclassified << " unclassified; fanning out";
+    const auto init_fn = [column_lists](PartitionBatch& /*batch*/,
+                                        LWPgsqlReadRequestPB& read_req) {
+      AttachHashColumnLists(read_req, column_lists);
+    };
+    // A partition's start key maps back to that partition. EnsurePartitionBatch skips partitions
+    // whose request range is empty and reuses ops the walk already created. Covered ops still
+    // inactive (request range narrower than the partition) are activated too: DocDB applies the
+    // request bounds.
+    for (const auto& partition_key : partition_keys) {
+      auto* batch = VERIFY_RESULT(EnsurePartitionBatch(
+          batches, partition_key, make_lw_function(op_provider), make_lw_function(init_fn),
+          &unclassified));
+      if (batch) {
+        batch->read_op->set_active(true);
+      }
+    }
   }
   // Match ClonePgsqlOps on the legacy hash-batch path: one Perform for every covered-tablet op.
   // ysql_select_parallelism is for range/aggregate scans, not this fan-out.
