@@ -362,6 +362,10 @@ class PgDocOp {
 
   virtual bool IsWrite() const = 0;
 
+  // Whether this op sends hash IN lists to DocDB as column_lists. Only PgDocReadOp can; a
+  // write op or a read served from prefetched catalog data never does.
+  virtual bool UseHashColumnLists() { return false; }
+
   Result<size_t> CreateRequests();
 
   const PgTable& table() const { return table_; }
@@ -516,6 +520,11 @@ class PgDocReadOp : public PgDocOp {
 
   Status ResetPgsqlOps();
 
+  // CanPushHashColumnLists() for the template request, computed once and cached. PgDmlRead asks
+  // this op too (ProcessEmptyKeyBinds), so both sides see one decision even if the GUC changes
+  // between the calls or before a rescan.
+  bool UseHashColumnLists() override;
+
  protected:
   Status CompleteProcessResponse() override;
 
@@ -629,10 +638,6 @@ class PgDocReadOp : public PgDocOp {
       PartitionBatches& partition_batches, const QLValuePBs& values,
       const ReadOpProvider& read_op_provider);
   LWPgsqlExpressionPB* InitHashPermutationBatch(LWPgsqlReadRequestPB& read_req);
-
-  // CanPushHashColumnLists() for the template request, computed once and cached so a rescan does
-  // not switch paths if the GUC changes.
-  bool UseHashColumnLists();
 
   // Routes a hash permutation to its partition op for the column_lists path. Unlike
   // BindExprsToBatch, this does not materialize the permutation: it only ensures the covered

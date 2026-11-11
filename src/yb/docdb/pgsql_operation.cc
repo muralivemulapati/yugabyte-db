@@ -2498,6 +2498,7 @@ Result<size_t> PgsqlReadOperation::Execute() {
     read_restart_data_->MakeAtLeast(VERIFY_RESULT(index_iter_->GetReadRestartData()));
   }
   read_restart_data_->MakeAtLeast(std::move(vector_search_read_restart_data_));
+  read_restart_data_->MakeAtLeast(std::move(replaced_iter_read_restart_data_));
   if (!read_restart_data_->is_valid()) {
     RETURN_NOT_OK(delayed_failure_);
   }
@@ -3089,6 +3090,15 @@ Result<std::tuple<size_t, bool>> PgsqlReadOperation::ExecuteScalar() {
     const size_t key_budget = !has_column_lists || row_count_limit == unlimited
         ? 0
         : std::max(row_count_limit - fetched_rows, min_key_budget);
+    // Init below replaces the previous slice's iterator. Keep its read restart, or a write it saw
+    // in the uncertainty window would be lost and the read would return a stale result.
+    if (!apply_row_key_paging) {
+      auto& replaced_iter = index_state ? index_iter_ : table_iter_;
+      if (replaced_iter) {
+        replaced_iter_read_restart_data_.MakeAtLeast(
+            VERIFY_RESULT(replaced_iter->GetReadRestartData()));
+      }
+    }
     if (index_state) {
       RETURN_NOT_OK(index_state->iter.Init(
           data_, request_.index_request(), index_state->projection, *data_.index_doc_read_context,
@@ -3204,23 +3214,23 @@ Result<std::tuple<size_t, bool>> PgsqlReadOperation::ExecuteScalar() {
         paging_state->set_hash_column_list_end(column_list_cursor.end);
       } else {
         // The slice ended on the row limit, so there is no next row key. begin is the next slice.
-        // Without a partition key, InitHashPartitionKey routes the follow-up to the first tablet.
         paging_state->set_hash_column_list_begin(column_list_cursor.end);
+        // Route the follow-up back to this tablet. The request's hash bounds would not do: after
+        // a split they span several tablets, and the follow-up would go to the first one, which
+        // re-reads from hash_column_list_begin and returns its rows again. The partition key is
+        // inclusive for a forward scan and exclusive for a backward one (see
+        // Tablet::NextReadPartitionKey). Without a partition key, InitHashPartitionKey routes the
+        // follow-up to the first (forward) or last (backward) tablet, which is this one when its
+        // bound is empty.
         // SetPagingState reads the direction from request_. With column_lists set, scan_request is
         // request_: only colocated, system, and copartitioned indexes embed index_request, and
         // those have no hash key columns.
-        if (scan_request.is_forward_scan()) {
-          if (scan_request.has_hash_code() && scan_request.hash_code() != 0) {
-            paging_state->dup_next_partition_key(
-                dockv::PartitionSchema::EncodeMultiColumnHashValue(
-                    static_cast<uint16_t>(scan_request.hash_code())));
-          }
-        } else if (scan_request.has_max_hash_code() &&
-                   static_cast<uint16_t>(scan_request.max_hash_code()) !=
-                       dockv::PartitionSchema::kMaxPartitionKey) {
-          paging_state->dup_next_partition_key(
-              dockv::PartitionSchema::EncodeMultiColumnHashValue(
-                  static_cast<uint16_t>(scan_request.max_hash_code()) + 1));
+        SCHECK(data_.partition, IllegalState, "column_lists read without the tablet partition");
+        const auto& partition_key = scan_request.is_forward_scan()
+            ? data_.partition->partition_key_start()
+            : data_.partition->partition_key_end();
+        if (!partition_key.empty()) {
+          paging_state->dup_next_partition_key(partition_key);
         }
         BindReadTimeToPagingState(data_.read_operation_data.read_time);
         has_paging_state = true;

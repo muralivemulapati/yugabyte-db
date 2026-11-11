@@ -2715,6 +2715,7 @@ Status Tablet::DoHandlePgsqlReadRequest(
       .pending_op = *scoped_read_operation,
       .vector_index = vector_index,
       .table_has_vector_deletion = vector_indexes().has_vector_deletion(),
+      .partition = metadata_->partition(),
     };
 
     status = ProcessPgsqlReadRequest(data, result);

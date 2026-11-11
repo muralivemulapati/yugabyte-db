@@ -342,8 +342,10 @@ Status PgDmlRead::ProcessEmptyKeyBinds() {
 
   // A compact request scans many hash keys, so a range equality cannot stay the scan prefix.
   // It has to move into condition_expr, as it does when hash batching is on.
-  if (!preceding_key_column_missed &&
-      CanPushHashColumnLists(*read_req_, pg_session_->GetIsolationLevel())) {
+  // Ask the doc op, which caches the decision it routes by. Without a doc op (embedded index
+  // subquery) no column_lists request is built from this read_req_. doc_op_ is not always a
+  // PgDocReadOp: a catalog read served from prefetched data runs PgDocReadOpCached.
+  if (!preceding_key_column_missed && doc_op_ && doc_op_->UseHashColumnLists()) {
     preceding_key_column_missed = true;
   }
 

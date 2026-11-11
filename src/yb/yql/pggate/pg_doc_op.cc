@@ -847,6 +847,14 @@ bool CouldBeExecutedInParallel(const LWPgsqlReadRequestPB& req) {
 }
 
 bool CanPushHashColumnLists(const LWPgsqlReadRequestPB& req, PgIsolationLevel isolation_level) {
+  if (!yb_push_hash_column_lists_to_docdb) {
+    return false;
+  }
+  // column_lists is one scan of many non-contiguous hash keys. Serializable cannot lock those
+  // keys from one request, so it stays on one point read per key.
+  if (isolation_level == PgIsolationLevel::SERIALIZABLE) {
+    return false;
+  }
   const auto& partition_column_values = req.partition_column_values();
   // Range and sequential scans have no hash binds.
   if (partition_column_values.empty()) {
@@ -856,12 +864,6 @@ bool CanPushHashColumnLists(const LWPgsqlReadRequestPB& req, PgIsolationLevel is
   // the tablets are read in parallel. A scan that needs order has its direction set (see
   // create_index_path in pathnode.c) and stays on the permutation path.
   if (req.has_is_forward_scan()) {
-    return false;
-  }
-  // column_lists is one scan of many non-contiguous hash keys. Serializable cannot lock those
-  // keys from one request, so it stays on one point read per key.
-  if (!yb_push_hash_column_lists_to_docdb ||
-      isolation_level == PgIsolationLevel::SERIALIZABLE) {
     return false;
   }
   // A single hash key (WHERE h = 5) stays on the exact-key path: column_lists clears
@@ -1470,30 +1472,31 @@ Result<bool> PgDocReadOp::PopulateHashColumnListsOps() {
   };
   // Pruning walks permutations until every tablet is classified. With T tablets that takes
   // ~T ln T permutations on average (coupon collector), but it takes the whole product when some
-  // tablet gets no permutation. Past the cap, the chance that a tablet is still unhit is ~1/T^2,
-  // so stop walking and fan out to every tablet left. That is safe: DocDB expands column_lists
-  // per tablet and a tablet with no matching permutation returns no rows.
+  // tablet gets no permutation. So walk only a product smaller than the cap. For a larger product
+  // the chance that a tablet gets no permutation within the cap is ~1/T^2, so skip the walk and
+  // fan out to every tablet. That is safe: DocDB expands column_lists per tablet and a tablet with
+  // no matching permutation returns no rows.
   const size_t num_partitions = partition_keys.size();
-  const auto walk_cap = static_cast<uint64_t>(std::ceil(
+  const auto walk_cap = static_cast<size_t>(std::ceil(
       kHashColumnListsWalkCapFactor * num_partitions *
       std::log(static_cast<double>(std::max<size_t>(num_partitions, 2)))));
-  uint64_t walked = 0;
-  for (; permutations.HasPermutation() && !can_stop() && walked < walk_cap; ++walked) {
-    RETURN_NOT_OK(ActivatePartitionForPermutation(
-        batches, permutations.NextPermutation(), make_lw_function(op_provider),
-        column_lists, &unclassified));
-  }
-  if (permutations.HasPermutation() && !can_stop()) {
-    VLOG(2) << "Hash column lists: walked " << walked << " permutations over " << num_partitions
-            << " tablets, " << unclassified << " unclassified; fanning out";
+  const auto num_permutations = permutations.Size();
+  if (num_permutations < walk_cap) {
+    while (permutations.HasPermutation() && !can_stop()) {
+      RETURN_NOT_OK(ActivatePartitionForPermutation(
+          batches, permutations.NextPermutation(), make_lw_function(op_provider),
+          column_lists, &unclassified));
+    }
+  } else {
+    VLOG(2) << "Hash column lists: " << num_permutations << " permutations over "
+            << num_partitions << " tablets, cap " << walk_cap << "; fanning out";
     const auto init_fn = [column_lists](PartitionBatch& /*batch*/,
                                         LWPgsqlReadRequestPB& read_req) {
       AttachHashColumnLists(read_req, column_lists);
     };
     // A partition's start key maps back to that partition. EnsurePartitionBatch skips partitions
-    // whose request range is empty and reuses ops the walk already created. Covered ops still
-    // inactive (request range narrower than the partition) are activated too: DocDB applies the
-    // request bounds.
+    // whose request range is empty. An op whose request range is narrower than its partition is
+    // activated too: DocDB applies the request bounds.
     for (const auto& partition_key : partition_keys) {
       auto* batch = VERIFY_RESULT(EnsurePartitionBatch(
           batches, partition_key, make_lw_function(op_provider), make_lw_function(init_fn),

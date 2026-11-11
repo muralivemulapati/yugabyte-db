@@ -171,6 +171,9 @@ struct PgsqlReadOperationData {
   const ScopedRWOperation& pending_op;
   DocVectorIndexPtr vector_index;
   bool table_has_vector_deletion = false;
+  // Partition of the tablet serving the read. A column_lists page that ends between slices names
+  // this tablet as the next partition, so the follow-up resumes here even after a split.
+  std::shared_ptr<const dockv::Partition> partition;
 };
 
 class PgsqlReadOperation : public DocExprExecutor {
@@ -248,6 +251,9 @@ class PgsqlReadOperation : public DocExprExecutor {
 
   boost::container::small_vector<dockv::PgWireEncoderEntry, 0x10> target_encoders_;
   YQLRowwiseIteratorIf::UniPtr table_iter_;
+  // Read restart data of iterators a column_lists scan replaced between slices. Execute() reads
+  // restart data only from the final table_iter_ / index_iter_.
+  ReadRestartData replaced_iter_read_restart_data_;
   YQLRowwiseIteratorIf::UniPtr index_iter_;
   // Read restart data of the vector search intents scan, filter and reverse mapping reader, which
   // table_iter_ does not cover.
